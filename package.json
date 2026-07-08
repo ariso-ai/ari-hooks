@@ -1,0 +1,26 @@
+{
+  "name": "ari-hooks",
+  "version": "0.1.0",
+  "description": "Set up Claude Code hooks that share your requests and their outcomes with Ari",
+  "type": "module",
+  "bin": {
+    "ari-hooks": "bin/ari-hooks.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "claude-code",
+    "hooks",
+    "ari",
+    "ariso"
+  ],
+  "license": "UNLICENSED"
+}
