@@ -39,11 +39,8 @@ function openBrowser(url) {
  * the web app's /cli-auth page with our callback URL, and wait for the
  * page to redirect back with a freshly minted API token.
  */
-export async function login({ webUrl, apiUrl } = {}) {
+export async function login() {
   const config = loadConfig();
-  if (webUrl) config.webUrl = webUrl;
-  if (apiUrl) config.apiUrl = apiUrl;
-
   const state = randomBytes(16).toString('hex');
 
   const token = await new Promise((resolve, reject) => {

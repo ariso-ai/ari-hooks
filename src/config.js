@@ -36,3 +36,43 @@ export function getApiUrl(config = loadConfig()) {
 export function getWebUrl(config = loadConfig()) {
   return process.env.ARI_HOOKS_WEB_URL || config.webUrl || DEFAULT_WEB_URL;
 }
+
+function normalizeUrl(raw, label) {
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`${label} is not a valid URL: ${raw}`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`${label} must be http(s): ${raw}`);
+  }
+  return url.toString().replace(/\/$/, '');
+}
+
+/** Persist base-URL overrides (e.g. point at localhost for testing). */
+export function setUrls({ webUrl, apiUrl, resetUrls }) {
+  const config = loadConfig();
+  if (resetUrls) {
+    delete config.webUrl;
+    delete config.apiUrl;
+  }
+  if (webUrl) config.webUrl = normalizeUrl(webUrl, '--web-url');
+  if (apiUrl) config.apiUrl = normalizeUrl(apiUrl, '--api-url');
+  saveConfig(config);
+  console.log(`Web URL: ${getWebUrl(config)}`);
+  console.log(`API URL: ${getApiUrl(config)}`);
+}
+
+export function showConfig() {
+  const config = loadConfig();
+  const note = (key, envVar) =>
+    process.env[envVar]
+      ? ` (from ${envVar})`
+      : config[key]
+        ? ' (configured)'
+        : ' (default)';
+  console.log(`Web URL: ${getWebUrl(config)}${note('webUrl', 'ARI_HOOKS_WEB_URL')}`);
+  console.log(`API URL: ${getApiUrl(config)}${note('apiUrl', 'ARI_HOOKS_API_URL')}`);
+  console.log(config.token ? `Logged in (since ${config.loggedInAt ?? 'unknown'})` : 'Not logged in.');
+}

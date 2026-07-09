@@ -107,7 +107,7 @@ async function onStop(input) {
   const config = loadConfig();
   if (!config.token) return;
 
-  const response = await fetch(new URL('/claude-tasks', getApiUrl(config)), {
+  const response = await fetch(new URL('/agent-activities', getApiUrl(config)), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -122,7 +122,7 @@ async function onStop(input) {
     signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
   });
   if (!response.ok) {
-    throw new Error(`POST /claude-tasks failed: ${response.status}`);
+    throw new Error(`POST /agent-activities failed: ${response.status}`);
   }
 
   rmSync(sessionPath(input.session_id), { force: true });

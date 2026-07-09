@@ -36,18 +36,30 @@ Existing settings and hooks are preserved; running it again is a no-op.
 | `ari-hooks` | Login (if needed) + set up hooks in the current folder |
 | `ari-hooks login` | Browser login, stores the API token |
 | `ari-hooks init` | Just add the hooks to `./.claude/settings.json` |
+| `ari-hooks config` | Show configured URLs and login state |
 | `ari-hooks status` | Show login state |
 | `ari-hooks logout` | Delete the stored token |
 
 ### Configuration
 
-Environment variables (all optional):
+By default the CLI talks to production (`https://web.ari.ariso.ai` /
+`https://api.ari.ariso.ai`). To test against a local Ari stack, persist
+overrides with the URL flags (they work on any command, including bare
+`ari-hooks`):
 
-- `ARI_HOOKS_API_URL` — override the API base URL (default `https://api.ari.ariso.ai`)
-- `ARI_HOOKS_WEB_URL` — override the web app URL used for login (default `https://web.ari.ariso.ai`)
+```bash
+ari-hooks config --web-url http://localhost:5173 --api-url http://localhost:4000
+ari-hooks login                # browser flow now goes through localhost
+ari-hooks config --reset-urls  # back to production
+```
+
+The overrides are stored in `~/.ari-hooks/config.json`, so the hooks
+themselves also report to the configured API. Environment variables take
+precedence over the stored config:
+
+- `ARI_HOOKS_API_URL` — override the API base URL
+- `ARI_HOOKS_WEB_URL` — override the web app URL used for login
 - `ARI_HOOKS_HOME` — override the config directory (default `~/.ari-hooks`)
-
-`--api-url` / `--web-url` flags on `login` persist the override into the config.
 
 ## Notes
 

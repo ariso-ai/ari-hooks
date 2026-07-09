@@ -105,7 +105,7 @@ test('user-prompt-submit + stop sends request/outcome to the API', async () => {
   server.close();
 
   assert.equal(received.length, 1);
-  assert.equal(received[0].url, '/claude-tasks');
+  assert.equal(received[0].url, '/agent-activities');
   assert.equal(received[0].auth, 'Bearer ari_testtoken');
   assert.equal(received[0].body.request, 'Fix the login bug');
   assert.equal(received[0].body.outcome, 'Fixed the login bug by patching auth.ts.');
@@ -114,6 +114,40 @@ test('user-prompt-submit + stop sends request/outcome to the API', async () => {
 
   // Session state is cleared after a successful send.
   assert.ok(!existsSync(join(home, 'sessions', 'sess-123.json')));
+});
+
+test('config --web-url/--api-url persists overrides; --reset-urls clears them', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ari-hooks-config-'));
+  const env = { ...process.env, ARI_HOOKS_HOME: home };
+  delete env.ARI_HOOKS_WEB_URL;
+  delete env.ARI_HOOKS_API_URL;
+
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    [BIN, 'config', '--web-url', 'http://localhost:5173/', '--api-url', 'http://localhost:4000'],
+    { env }
+  );
+  assert.match(stdout, /Web URL: http:\/\/localhost:5173/);
+  assert.match(stdout, /API URL: http:\/\/localhost:4000/);
+
+  // Trailing slash is normalized away and the values survive a reload.
+  const saved = JSON.parse(readFileSync(join(home, 'config.json'), 'utf8'));
+  assert.equal(saved.webUrl, 'http://localhost:5173');
+  assert.equal(saved.apiUrl, 'http://localhost:4000');
+
+  // An invalid URL is rejected without clobbering the config.
+  await assert.rejects(
+    execFileAsync(process.execPath, [BIN, 'config', '--api-url', 'not-a-url'], { env }),
+    /not a valid URL/
+  );
+
+  const { stdout: reset } = await execFileAsync(
+    process.execPath,
+    [BIN, 'config', '--reset-urls'],
+    { env }
+  );
+  assert.match(reset, /Web URL: https:\/\/web\.ari\.ariso\.ai/);
+  assert.match(reset, /API URL: https:\/\/api\.ari\.ariso\.ai/);
 });
 
 test('stop hook is a silent no-op without a stored prompt or token', async () => {
