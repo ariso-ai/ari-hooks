@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
 const HOOK_EVENTS = {
+  SessionStart: 'ari-hooks hook session-start',
   UserPromptSubmit: 'ari-hooks hook user-prompt-submit',
   Stop: 'ari-hooks hook stop',
 };
@@ -50,6 +51,7 @@ export function init(cwd = process.cwd()) {
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
   console.log(`✓ Ari hooks added to ${settingsPath}`);
   console.log(
-    'Claude Code sessions in this folder will now share each request and its outcome with Ari.'
+    'Claude Code sessions in this folder will now share each request and its outcome with Ari,'
   );
+  console.log('and show suggested Ari tasks when a session starts.');
 }

@@ -2,7 +2,9 @@
 
 Shares your Claude Code activity with [Ari](https://ariso.ai): after every
 Claude Code turn, the hooks send your request and the final outcome (not the
-intermediate steps) to Ari.
+intermediate steps) to Ari. When a session starts, Ari suggests the top
+things Claude can take care of for you right now — pick one and Claude runs
+it.
 
 ## Install
 
@@ -22,7 +24,9 @@ That single command:
 
 1. Opens your browser to log in to Ari and mint an API token (stored in
    `~/.ari-hooks/config.json`, `0600`). Only needed once per machine.
-2. Adds two hooks to `./.claude/settings.json`:
+2. Adds three hooks to `./.claude/settings.json`:
+   - `SessionStart` — fetches Ari's top suggested tasks and shows them when
+     Claude Code boots; reply with a task number or name to run one
    - `UserPromptSubmit` — records what you asked for
    - `Stop` — reads the final assistant message from the transcript and sends
      the request/outcome pair to the Ari API

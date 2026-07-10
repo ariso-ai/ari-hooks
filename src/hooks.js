@@ -3,6 +3,7 @@ import {
   mkdirSync,
   readFileSync,
   writeFileSync,
+  writeSync,
   rmSync,
   appendFileSync,
 } from 'node:fs';
@@ -128,6 +129,89 @@ async function onStop(input) {
   rmSync(sessionPath(input.session_id), { force: true });
 }
 
+const MAX_TASKS = 3;
+const MAX_TASK_NAME_LENGTH = 200;
+
+const oneLine = (text) =>
+  text.replace(/\s+/g, ' ').trim().slice(0, MAX_TASK_NAME_LENGTH);
+
+/**
+ * SessionStart: ask Ari for the top tasks Claude can take care of right now
+ * and surface them at boot — a visible list for the user (systemMessage)
+ * plus the full prompts for Claude (additionalContext) so it can run
+ * whichever one the user picks.
+ */
+async function onSessionStart(input) {
+  // Compaction restarts the session mid-conversation; the tasks were
+  // already offered, so don't show (or inject) them again.
+  if (input.source === 'compact') return;
+
+  const config = loadConfig();
+  if (!config.token) return;
+
+  const response = await fetch(new URL('/agent-tasks', getApiUrl(config)), {
+    headers: { Authorization: `Bearer ${config.token}` },
+    signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new Error(`GET /agent-tasks failed: ${response.status}`);
+  }
+
+  const body = await response.json();
+  // The API wraps the list ({ tasks: [...] }); accept a bare array too.
+  const list = Array.isArray(body) ? body : Array.isArray(body?.tasks) ? body.tasks : [];
+  const tasks = list
+    .filter(
+      (t) =>
+        t &&
+        typeof t.taskName === 'string' &&
+        t.taskName.trim() &&
+        typeof t.prompt === 'string' &&
+        t.prompt.trim()
+    )
+    .slice(0, MAX_TASKS);
+  if (tasks.length === 0) return;
+
+  // Claude Code renders systemMessage with ANSI intact; the leading \n
+  // pushes our block below the fixed "SessionStart:<source> says:" prefix.
+  const BOLD = '\x1b[1m';
+  const CYAN = '\x1b[36m';
+  const GREY = '\x1b[37m';
+  const RESET = '\x1b[0m';
+  const visibleList = tasks
+    .map((t, i) => `  ${BOLD}${i + 1}.${RESET} ${oneLine(t.taskName)}`)
+    .join('\n');
+  const systemMessage =
+    `\n${BOLD}${CYAN}✻ Ari — things Claude can take care of for you right now${RESET}\n` +
+    `${visibleList}\n` +
+    `${GREY}Reply "run task 1" (or the task name) to start one.${RESET}`;
+
+  const additionalContext =
+    `The user has Ari connected via ari-hooks. At session start the user was ` +
+    `shown this list of suggested tasks:\n\n` +
+    tasks
+      .map(
+        (t, i) =>
+          `Task ${i + 1}: ${oneLine(t.taskName)}\nPrompt: ${clamp(t.prompt)}`
+      )
+      .join('\n\n') +
+    `\n\nIf the user asks to run one of these tasks (by number or name), ` +
+    `carry out that task's prompt as if the user had typed it. Do not start ` +
+    `any of these tasks unless the user asks.`;
+
+  // writeSync: process.exit(0) in runHook would race an async stdout write.
+  writeSync(
+    1,
+    JSON.stringify({
+      systemMessage,
+      hookSpecificOutput: {
+        hookEventName: 'SessionStart',
+        additionalContext,
+      },
+    }) + '\n'
+  );
+}
+
 /**
  * Entry point for `ari-hooks hook <event>`. Hooks must never break the
  * user's Claude Code session: all failures are swallowed (logged to
@@ -141,6 +225,8 @@ export async function runHook(event) {
       await onUserPromptSubmit(input);
     } else if (event === 'stop') {
       await onStop(input);
+    } else if (event === 'session-start') {
+      await onSessionStart(input);
     }
   } catch (err) {
     logError(err);

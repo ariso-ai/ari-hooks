@@ -43,12 +43,14 @@ test('init merges hooks into .claude/settings.json and is idempotent', async () 
   assert.equal(settings.hooks.Stop[0].hooks[0].command, 'echo done');
   assert.match(settings.hooks.Stop[1].hooks[0].command, /ari-hooks hook stop/);
   assert.match(settings.hooks.UserPromptSubmit[0].hooks[0].command, /ari-hooks hook user-prompt-submit/);
+  assert.match(settings.hooks.SessionStart[0].hooks[0].command, /ari-hooks hook session-start/);
 
   // Second run adds nothing.
   await execFileAsync(process.execPath, [BIN, 'init'], { cwd });
   const again = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.json'), 'utf8'));
   assert.equal(again.hooks.Stop.length, 2);
   assert.equal(again.hooks.UserPromptSubmit.length, 1);
+  assert.equal(again.hooks.SessionStart.length, 1);
 });
 
 test('user-prompt-submit + stop sends request/outcome to the API', async () => {
@@ -168,6 +170,86 @@ test('config --web-url/--api-url persists overrides; --reset-urls clears them', 
   );
   assert.match(reset, /Web URL: https:\/\/web\.ari\.ariso\.ai/);
   assert.match(reset, /API URL: https:\/\/api\.ari\.ariso\.ai/);
+});
+
+test('session-start fetches /agent-tasks and emits a visible list plus context', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));
+
+  const requests = [];
+  const server = createServer((req, res) => {
+    requests.push({ url: req.url, auth: req.headers.authorization });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    // The real API wraps the list in { tasks: [...] }.
+    res.end(
+      JSON.stringify({
+        tasks: [
+          { taskName: 'Triage new bug reports', prompt: 'Look at the open bug reports and triage them.' },
+          { taskName: 'Update the changelog', prompt: 'Write changelog entries for unreleased commits.' },
+          { taskName: 'Fix flaky tests', prompt: 'Find and fix the flaky tests in CI.' },
+          { taskName: 'A fourth task that must be dropped', prompt: 'nope' },
+        ],
+      })
+    );
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const apiUrl = `http://127.0.0.1:${server.address().port}`;
+
+  writeFileSync(
+    join(home, 'config.json'),
+    JSON.stringify({ token: 'ari_testtoken', apiUrl })
+  );
+
+  const { stdout } = await runHook(
+    'session-start',
+    { session_id: 'sess-1', source: 'startup', cwd: '/tmp/project' },
+    home
+  );
+  server.close();
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, '/agent-tasks');
+  assert.equal(requests[0].auth, 'Bearer ari_testtoken');
+
+  const output = JSON.parse(stdout);
+  // The user-visible list names the top 3 tasks, nothing more (ANSI styling
+  // sits between the number and the name).
+  assert.match(output.systemMessage, /1\..*Triage new bug reports/);
+  assert.match(output.systemMessage, /3\..*Fix flaky tests/);
+  assert.doesNotMatch(output.systemMessage, /fourth task/);
+  // Claude's hidden context carries the prompts to run on request.
+  assert.equal(output.hookSpecificOutput.hookEventName, 'SessionStart');
+  assert.match(
+    output.hookSpecificOutput.additionalContext,
+    /Look at the open bug reports and triage them\./
+  );
+});
+
+test('session-start is a silent no-op on compact, without a token, or with no tasks', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));
+
+  // No token → no output, no network.
+  let result = await runHook('session-start', { source: 'startup' }, home);
+  assert.equal(result.stdout, '');
+
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify([]));
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const apiUrl = `http://127.0.0.1:${server.address().port}`;
+  writeFileSync(
+    join(home, 'config.json'),
+    JSON.stringify({ token: 'ari_testtoken', apiUrl })
+  );
+
+  // Compact → skipped even when logged in.
+  result = await runHook('session-start', { source: 'compact' }, home);
+  assert.equal(result.stdout, '');
+
+  // Empty task list → nothing shown.
+  result = await runHook('session-start', { source: 'startup' }, home);
+  assert.equal(result.stdout, '');
+  server.close();
 });
 
 test('stop hook is a silent no-op without a stored prompt or token', async () => {
