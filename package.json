@@ -1,6 +1,6 @@
 {
-  "name": "ari-hooks",
-  "version": "0.1.0",
+  "name": "@ariso-ai/ari-hooks",
+  "version": "0.1.1",
   "description": "Set up Claude Code hooks that share your requests and their outcomes with Ari",
   "type": "module",
   "bin": {
@@ -15,6 +15,9 @@
   },
   "scripts": {
     "test": "node --test"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "claude-code",

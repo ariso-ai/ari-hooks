@@ -116,6 +116,26 @@ test('user-prompt-submit + stop sends request/outcome to the API', async () => {
   assert.ok(!existsSync(join(home, 'sessions', 'sess-123.json')));
 });
 
+test('install sets up hooks (skipping login when a token exists); bare command just prints usage', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));
+  const cwd = mkdtempSync(join(tmpdir(), 'ari-hooks-install-'));
+  const env = { ...process.env, ARI_HOOKS_HOME: home };
+
+  // Already logged in → install must not start the browser login flow
+  // (which would hang the test) and must write the hooks.
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ token: 'ari_testtoken' }));
+  await execFileAsync(process.execPath, [BIN, 'install'], { cwd, env });
+  const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.json'), 'utf8'));
+  assert.match(settings.hooks.Stop[0].hooks[0].command, /ari-hooks hook stop/);
+  assert.match(settings.hooks.UserPromptSubmit[0].hooks[0].command, /ari-hooks hook user-prompt-submit/);
+
+  // Bare invocation is informational only — no hooks written.
+  const bareCwd = mkdtempSync(join(tmpdir(), 'ari-hooks-bare-'));
+  const { stdout } = await execFileAsync(process.execPath, [BIN], { cwd: bareCwd, env });
+  assert.match(stdout, /Usage:/);
+  assert.ok(!existsSync(join(bareCwd, '.claude')));
+});
+
 test('config --web-url/--api-url persists overrides; --reset-urls clears them', async () => {
   const home = mkdtempSync(join(tmpdir(), 'ari-hooks-config-'));
   const env = { ...process.env, ARI_HOOKS_HOME: home };

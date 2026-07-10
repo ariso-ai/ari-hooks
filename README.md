@@ -15,7 +15,7 @@ npm install -g ari-hooks
 In any project folder where you use Claude Code:
 
 ```bash
-ari-hooks
+ari-hooks install
 ```
 
 That single command:
@@ -33,9 +33,9 @@ Existing settings and hooks are preserved; running it again is a no-op.
 
 | Command | What it does |
 |---|---|
-| `ari-hooks` | Login (if needed) + set up hooks in the current folder |
+| `ari-hooks install` | Login (if needed) + set up hooks in the current folder |
 | `ari-hooks login` | Browser login, stores the API token |
-| `ari-hooks init` | Just add the hooks to `./.claude/settings.json` |
+| `ari-hooks init` | Just add the hooks to `./.claude/settings.json` (no login) |
 | `ari-hooks config` | Show configured URLs and login state |
 | `ari-hooks status` | Show login state |
 | `ari-hooks logout` | Delete the stored token |
@@ -44,8 +44,7 @@ Existing settings and hooks are preserved; running it again is a no-op.
 
 By default the CLI talks to production (`https://web.ari.ariso.ai` /
 `https://api.ari.ariso.ai`). To test against a local Ari stack, persist
-overrides with the URL flags (they work on any command, including bare
-`ari-hooks`):
+overrides with the URL flags (they work on any command):
 
 ```bash
 ari-hooks config --web-url http://localhost:5173 --api-url http://localhost:4000

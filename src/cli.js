@@ -6,9 +6,9 @@ import { loadConfig, setUrls, showConfig } from './config.js';
 const USAGE = `ari-hooks — share your Claude Code activity with Ari
 
 Usage:
-  ari-hooks              Log in (if needed) and set up hooks in the current folder
+  ari-hooks install      Log in (if needed) and set up hooks in the current folder
   ari-hooks login        Log in via the browser and store an API token
-  ari-hooks init         Add the hooks to ./.claude/settings.json
+  ari-hooks init         Just add the hooks to ./.claude/settings.json (no login)
   ari-hooks config       Show the configured URLs and login state
   ari-hooks status       Show login state
   ari-hooks logout       Remove the stored token
@@ -63,22 +63,26 @@ export async function main(argv) {
     case 'config':
       showConfig();
       return;
-    case 'init':
-      init();
-      return;
-    case 'hook':
-      await runHook(rest[1]);
-      return;
-    case undefined: {
-      // Bare invocation: make "npx/global install → run once in a folder"
-      // the whole setup story. URL-only invocations (e.g. `ari-hooks
-      // --web-url ...`) still run the full setup with the new URLs.
+    case 'install': {
       if (!loadConfig().token) {
         await login();
       }
       init();
       return;
     }
+    case 'init':
+      init();
+      return;
+    case 'hook':
+      await runHook(rest[1]);
+      return;
+    case undefined:
+      // URL-only invocations (e.g. `ari-hooks --web-url ...`) are a
+      // complete action — setUrls already printed the resulting config.
+      if (!flags.webUrl && !flags.apiUrl && !flags.resetUrls) {
+        console.log(USAGE);
+      }
+      return;
     default:
       console.error(`Unknown command: ${command}\n`);
       console.log(USAGE);
