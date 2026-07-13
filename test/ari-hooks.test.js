@@ -11,12 +11,12 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 const BIN = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'ari-hooks.js');
 
-function runHook(event, input, home) {
+function runHook(event, input, home, env = {}) {
   return new Promise((resolve, reject) => {
     const child = execFile(
       process.execPath,
       [BIN, 'hook', event],
-      { env: { ...process.env, ARI_HOOKS_HOME: home } },
+      { env: { ...process.env, ARI_HOOKS_HOME: home, ...env } },
       (err, stdout, stderr) => (err ? reject(err) : resolve({ stdout, stderr }))
     );
     child.stdin.end(JSON.stringify(input));
@@ -51,6 +51,51 @@ test('init merges hooks into .claude/settings.json and is idempotent', async () 
   assert.equal(again.hooks.Stop.length, 2);
   assert.equal(again.hooks.UserPromptSubmit.length, 1);
   assert.equal(again.hooks.SessionStart.length, 1);
+});
+
+test('uninstall removes only the ari-hooks entries and is safe to re-run', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'ari-hooks-uninstall-'));
+  mkdirSync(join(cwd, '.claude'));
+  writeFileSync(
+    join(cwd, '.claude', 'settings.json'),
+    JSON.stringify({
+      permissions: { allow: ['Bash(ls:*)'] },
+      hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo done' }] }] },
+    })
+  );
+
+  await execFileAsync(process.execPath, [BIN, 'init'], { cwd });
+  const { stdout } = await execFileAsync(process.execPath, [BIN, 'uninstall'], { cwd });
+  assert.match(stdout, /removed/);
+
+  const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.json'), 'utf8'));
+  // Unrelated settings and hooks survive; ari-hooks entries are gone.
+  assert.deepEqual(settings.permissions, { allow: ['Bash(ls:*)'] });
+  assert.deepEqual(settings.hooks, {
+    Stop: [{ hooks: [{ type: 'command', command: 'echo done' }] }],
+  });
+
+  // Second run finds nothing to remove and leaves the file untouched.
+  const { stdout: again } = await execFileAsync(process.execPath, [BIN, 'uninstall'], { cwd });
+  assert.match(again, /nothing to remove/);
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(cwd, '.claude', 'settings.json'), 'utf8')),
+    settings
+  );
+
+  // A folder that was never installed is a friendly no-op too.
+  const bare = mkdtempSync(join(tmpdir(), 'ari-hooks-uninstall-bare-'));
+  const { stdout: none } = await execFileAsync(process.execPath, [BIN, 'uninstall'], { cwd: bare });
+  assert.match(none, /nothing to remove/);
+});
+
+test('uninstall drops the hooks key entirely when ari-hooks was the only hook', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'ari-hooks-uninstall-only-'));
+  await execFileAsync(process.execPath, [BIN, 'init'], { cwd });
+  await execFileAsync(process.execPath, [BIN, 'uninstall'], { cwd });
+
+  const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.json'), 'utf8'));
+  assert.deepEqual(settings, {});
 });
 
 test('user-prompt-submit + stop sends request/outcome to the API', async () => {
@@ -116,6 +161,113 @@ test('user-prompt-submit + stop sends request/outcome to the API', async () => {
 
   // Session state is cleared after a successful send.
   assert.ok(!existsSync(join(home, 'sessions', 'sess-123.json')));
+});
+
+// Helper for the stop-hook race tests: a stub API plus a config pointing at it.
+async function stopTestSetup() {
+  const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));
+  const received = [];
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => {
+      received.push(JSON.parse(body));
+      res.writeHead(201, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ id: 'evt_1' }));
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  writeFileSync(
+    join(home, 'config.json'),
+    JSON.stringify({ token: 'ari_testtoken', apiUrl: `http://127.0.0.1:${server.address().port}` })
+  );
+  return { home, received, server };
+}
+
+// Claude Code fires Stop while the final assistant message may still be
+// mid-flush: the transcript ends at the tool result (plus a half-written
+// line). The hook must wait for the real final message instead of shipping
+// the pre-tool narration as the outcome.
+test('stop waits for the final assistant message to finish flushing', async () => {
+  const { home, received, server } = await stopTestSetup();
+  const transcriptPath = join(home, 'transcript.jsonl');
+
+  const midFlush =
+    [
+      JSON.stringify({ type: 'user', message: { content: 'Trace the LLM call' } }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { id: 'msg_1', content: [{ type: 'text', text: 'Now running verification as required.' }] },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { id: 'msg_1', content: [{ type: 'tool_use', name: 'Bash' }] },
+      }),
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result' }] } }),
+      JSON.stringify({ type: 'attachment' }),
+    ].join('\n') + '\n{"type":"assis'; // final message cut off mid-write
+
+  const complete =
+    midFlush.slice(0, midFlush.lastIndexOf('{')) +
+    [
+      // Final message split across two entries (one per content block).
+      JSON.stringify({
+        type: 'assistant',
+        message: { id: 'msg_2', content: [{ type: 'text', text: 'Done. The LLM call now traces to Langfuse.' }] },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { id: 'msg_2', content: [{ type: 'text', text: 'All 219 verification tasks passed.' }] },
+      }),
+      JSON.stringify({ type: 'system', subtype: 'turn_duration' }),
+      '',
+    ].join('\n');
+
+  writeFileSync(transcriptPath, midFlush);
+  await runHook('user-prompt-submit', { session_id: 'sess-race', prompt: 'Trace the LLM call' }, home);
+
+  // Finish the flush ~300ms after the stop hook starts reading.
+  const flush = setTimeout(() => writeFileSync(transcriptPath, complete), 300);
+  await runHook('stop', { session_id: 'sess-race', transcript_path: transcriptPath }, home);
+  clearTimeout(flush);
+  server.close();
+
+  assert.equal(received.length, 1);
+  assert.equal(
+    received[0].outcome,
+    'Done. The LLM call now traces to Langfuse.\nAll 219 verification tasks passed.'
+  );
+});
+
+// If the final message never lands, time out and fall back to the last
+// assistant text we did find rather than dropping the activity.
+test('stop falls back to the pre-tool narration when the flush never settles', async () => {
+  const { home, received, server } = await stopTestSetup();
+  const transcriptPath = join(home, 'transcript.jsonl');
+  writeFileSync(
+    transcriptPath,
+    [
+      JSON.stringify({ type: 'user', message: { content: 'Trace the LLM call' } }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { id: 'msg_1', content: [{ type: 'text', text: 'Now running verification as required.' }] },
+      }),
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result' }] } }),
+      '',
+    ].join('\n')
+  );
+
+  await runHook('user-prompt-submit', { session_id: 'sess-stall', prompt: 'Trace the LLM call' }, home);
+  await runHook(
+    'stop',
+    { session_id: 'sess-stall', transcript_path: transcriptPath },
+    home,
+    { ARI_HOOKS_SETTLE_TIMEOUT_MS: '400' }
+  );
+  server.close();
+
+  assert.equal(received.length, 1);
+  assert.equal(received[0].outcome, 'Now running verification as required.');
 });
 
 test('install sets up hooks (skipping login when a token exists); bare command just prints usage', async () => {

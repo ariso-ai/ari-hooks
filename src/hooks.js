@@ -11,6 +11,14 @@ import { configDir, loadConfig, getApiUrl } from './config.js';
 
 const MAX_TEXT_LENGTH = 100_000;
 const SEND_TIMEOUT_MS = 15_000;
+// Claude Code can fire Stop while the final assistant message is still being
+// flushed to the transcript; poll until the tail settles (or give up).
+const OUTCOME_POLL_INTERVAL_MS = 150;
+const OUTCOME_SETTLE_TIMEOUT_MS = Number(
+  process.env.ARI_HOOKS_SETTLE_TIMEOUT_MS ?? 5_000
+);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const sessionsDir = () => join(configDir(), 'sessions');
 const sessionPath = (sessionId) =>
@@ -61,29 +69,62 @@ async function onUserPromptSubmit(input) {
   saveSession(input.session_id, session);
 }
 
+function assistantText(entry) {
+  if (entry.type !== 'assistant' || !Array.isArray(entry.message?.content)) {
+    return '';
+  }
+  return entry.message.content
+    .filter((block) => block.type === 'text' && block.text)
+    .map((block) => block.text)
+    .join('\n')
+    .trim();
+}
+
 /**
  * Pull the final assistant text out of the transcript (JSONL). This is the
  * "outcome" — we deliberately skip the intermediate steps/tool calls.
+ *
+ * `settled` reports whether the exchange actually ends in assistant text.
+ * When the transcript instead ends at a tool call/result or a half-written
+ * line, the final message hasn't been flushed yet and `text` is only the
+ * last narration before a tool ran — the caller should re-read rather than
+ * ship that as the outcome.
  */
 function extractOutcome(transcriptPath) {
-  const lines = readFileSync(transcriptPath, 'utf8').split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (!lines[i].trim()) continue;
-    let entry;
+  const entries = [];
+  let tailPartial = false;
+  for (const line of readFileSync(transcriptPath, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
     try {
-      entry = JSON.parse(lines[i]);
+      entries.push(JSON.parse(line));
+      tailPartial = false;
     } catch {
+      tailPartial = true; // a line still being written
+    }
+  }
+
+  let settled = tailPartial ? false : null;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    // Bookkeeping entries (system, attachment, last-prompt, …) may trail
+    // the exchange; they say nothing about whether it is complete.
+    if (entry.type !== 'assistant' && entry.type !== 'user') continue;
+    let text = assistantText(entry);
+    if (!text) {
+      // A tool call/result with nothing after it: mid-turn.
+      settled ??= false;
       continue;
     }
-    if (entry.type !== 'assistant' || !entry.message?.content) continue;
-    const text = entry.message.content
-      .filter((block) => block.type === 'text' && block.text)
-      .map((block) => block.text)
-      .join('\n')
-      .trim();
-    if (text) return text;
+    // The message may span several JSONL entries (one per content block);
+    // stitch earlier blocks of the same message back on.
+    const id = entry.message?.id;
+    for (let j = i - 1; id && j >= 0 && entries[j].message?.id === id; j--) {
+      const earlier = assistantText(entries[j]);
+      if (earlier) text = `${earlier}\n${text}`;
+    }
+    return { text, settled: settled ?? true };
   }
-  return null;
+  return { text: null, settled: false };
 }
 
 const clamp = (text) =>
@@ -102,7 +143,16 @@ async function onStop(input) {
   const session = loadSession(input.session_id);
   if (session.prompts.length === 0) return;
 
-  const outcome = extractOutcome(input.transcript_path);
+  // Wait for the final assistant message to land in the transcript; on
+  // timeout fall back to the last text we did find (best effort).
+  const deadline = Date.now() + OUTCOME_SETTLE_TIMEOUT_MS;
+  let outcome;
+  for (;;) {
+    const { text, settled } = extractOutcome(input.transcript_path);
+    outcome = text;
+    if (settled || Date.now() >= deadline) break;
+    await sleep(OUTCOME_POLL_INTERVAL_MS);
+  }
   if (!outcome) return;
 
   const config = loadConfig();

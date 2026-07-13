@@ -38,6 +38,7 @@ Existing settings and hooks are preserved; running it again is a no-op.
 | Command | What it does |
 |---|---|
 | `ari-hooks install` | Login (if needed) + set up hooks in the current folder |
+| `ari-hooks uninstall` | Remove the hooks from `./.claude/settings.json` |
 | `ari-hooks login` | Browser login, stores the API token |
 | `ari-hooks init` | Just add the hooks to `./.claude/settings.json` (no login) |
 | `ari-hooks config` | Show configured URLs and login state |

@@ -1,5 +1,5 @@
 import { login, logout, status } from './login.js';
-import { init } from './init.js';
+import { init, uninstall } from './init.js';
 import { runHook } from './hooks.js';
 import { loadConfig, setUrls, showConfig } from './config.js';
 
@@ -7,6 +7,7 @@ const USAGE = `ari-hooks — share your Claude Code activity with Ari
 
 Usage:
   ari-hooks install      Log in (if needed) and set up hooks in the current folder
+  ari-hooks uninstall    Remove the hooks from ./.claude/settings.json
   ari-hooks login        Log in via the browser and store an API token
   ari-hooks init         Just add the hooks to ./.claude/settings.json (no login)
   ari-hooks config       Show the configured URLs and login state
@@ -72,6 +73,9 @@ export async function main(argv) {
     }
     case 'init':
       init();
+      return;
+    case 'uninstall':
+      uninstall();
       return;
     case 'hook':
       await runHook(rest[1]);
