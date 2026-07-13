@@ -95,14 +95,59 @@ test('init inside Cursor also writes .cursor/hooks.json and is idempotent', asyn
   );
 });
 
+// Blanks every Cursor marker: simulates a terminal that is not inside
+// Cursor even when the test runner itself is.
+const NOT_CURSOR_ENV = {
+  CURSOR_TRACE_ID: '',
+  CURSOR_AGENT: '',
+  __CFBundleIdentifier: '',
+  GIT_ASKPASS: '',
+  VSCODE_GIT_ASKPASS_NODE: '',
+  VSCODE_GIT_ASKPASS_MAIN: '',
+};
+
 test('init outside Cursor leaves .cursor alone', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'ari-hooks-nocursor-init-'));
-  // Empty strings are falsy: simulates a terminal that is not inside Cursor
-  // even when the test runner itself is.
-  const env = { ...process.env, CURSOR_TRACE_ID: '', CURSOR_AGENT: '' };
+  const env = { ...process.env, ...NOT_CURSOR_ENV };
   await execFileAsync(process.execPath, [BIN, 'init'], { cwd, env });
   assert.ok(existsSync(join(cwd, '.claude', 'settings.json')));
   assert.ok(!existsSync(join(cwd, '.cursor')));
+});
+
+test('isCursor spots agent vars, the bundle id, and Cursor install paths', async () => {
+  const { isCursor } = await import('../src/init.js');
+
+  assert.equal(isCursor({}), false);
+  // Plain VS Code: TERM_PROGRAM matches but the install paths do not.
+  assert.equal(
+    isCursor({
+      TERM_PROGRAM: 'vscode',
+      GIT_ASKPASS:
+        '/Applications/Visual Studio Code.app/Contents/Resources/app/extensions/git/dist/askpass.sh',
+      __CFBundleIdentifier: 'com.microsoft.VSCode',
+    }),
+    false
+  );
+
+  assert.equal(isCursor({ CURSOR_TRACE_ID: 'trace-abc' }), true);
+  assert.equal(isCursor({ CURSOR_AGENT: '1' }), true);
+  // Regular Cursor integrated terminal on macOS: ToDesktop bundle id.
+  assert.equal(isCursor({ __CFBundleIdentifier: 'com.todesktop.230313mzl4w4u92' }), true);
+  // Helper paths point into the Cursor install (any platform).
+  assert.equal(
+    isCursor({
+      GIT_ASKPASS:
+        '/Applications/Cursor.app/Contents/Resources/app/extensions/git/dist/askpass.sh',
+    }),
+    true
+  );
+  assert.equal(
+    isCursor({
+      VSCODE_GIT_ASKPASS_NODE:
+        'C:\\Users\\max\\AppData\\Local\\Programs\\cursor\\Cursor.exe',
+    }),
+    true
+  );
 });
 
 test('uninstall removes only the ari-hooks entries and is safe to re-run', async () => {
@@ -398,6 +443,19 @@ test('install sets up hooks (skipping login when a token exists); bare command j
   const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.json'), 'utf8'));
   assert.match(settings.hooks.Stop[0].hooks[0].command, /ari-hooks hook stop/);
   assert.match(settings.hooks.UserPromptSubmit[0].hooks[0].command, /ari-hooks hook user-prompt-submit/);
+
+  // Inside Cursor, install writes .cursor/hooks.json alongside the Claude
+  // settings, exactly like init does.
+  const cursorCwd = mkdtempSync(join(tmpdir(), 'ari-hooks-install-cursor-'));
+  await execFileAsync(process.execPath, [BIN, 'install'], {
+    cwd: cursorCwd,
+    env: { ...env, CURSOR_TRACE_ID: 'trace-abc' },
+  });
+  assert.ok(existsSync(join(cursorCwd, '.claude', 'settings.json')));
+  const cursorHooks = JSON.parse(
+    readFileSync(join(cursorCwd, '.cursor', 'hooks.json'), 'utf8')
+  );
+  assert.match(cursorHooks.hooks.stop[0].command, /ari-hooks hook stop/);
 
   // Bare invocation is informational only — no hooks written.
   const bareCwd = mkdtempSync(join(tmpdir(), 'ari-hooks-bare-'));

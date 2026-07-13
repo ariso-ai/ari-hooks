@@ -20,12 +20,33 @@ const CURSOR_HOOK_EVENTS = {
   stop: 'ari-hooks hook stop',
 };
 
+// Cursor's app install shows up in the env vars its integrated terminal
+// inherits: the git-askpass helpers point into Cursor.app (macOS),
+// AppData\Local\Programs\cursor (Windows), or a cursor install dir (Linux).
+const CURSOR_PATH_VARS = [
+  'GIT_ASKPASS',
+  'VSCODE_GIT_ASKPASS_NODE',
+  'VSCODE_GIT_ASKPASS_MAIN',
+];
+
+// Cursor ships via ToDesktop, so its macOS bundle id is this opaque token
+// rather than anything containing "cursor".
+const CURSOR_BUNDLE_ID = 'com.todesktop.230313mzl4w4u92';
+
 /**
- * Cursor's integrated terminal exports CURSOR_TRACE_ID and its CLI agent
- * exports CURSOR_AGENT; neither is set by plain VS Code or a bare shell.
+ * Cursor's agent terminals export CURSOR_TRACE_ID and its CLI agent exports
+ * CURSOR_AGENT, but a regular integrated terminal in Cursor sets neither —
+ * it looks like VS Code (TERM_PROGRAM=vscode). There, the tells are the
+ * app's bundle id and the helper paths pointing into the Cursor install;
+ * plain VS Code and a bare shell match none of these.
  */
 export const isCursor = (env = process.env) =>
-  Boolean(env.CURSOR_TRACE_ID || env.CURSOR_AGENT);
+  Boolean(
+    env.CURSOR_TRACE_ID ||
+      env.CURSOR_AGENT ||
+      env.__CFBundleIdentifier === CURSOR_BUNDLE_ID ||
+      CURSOR_PATH_VARS.some((key) => /cursor/i.test(env[key] ?? ''))
+  );
 
 function readJson(path) {
   try {
