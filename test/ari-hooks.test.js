@@ -53,6 +53,58 @@ test('init merges hooks into .claude/settings.json and is idempotent', async () 
   assert.equal(again.hooks.SessionStart.length, 1);
 });
 
+test('init inside Cursor also writes .cursor/hooks.json and is idempotent', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'ari-hooks-cursor-init-'));
+  // Pre-existing Cursor hooks must survive the merge.
+  mkdirSync(join(cwd, '.cursor'));
+  writeFileSync(
+    join(cwd, '.cursor', 'hooks.json'),
+    JSON.stringify({
+      version: 1,
+      hooks: { stop: [{ command: 'echo done' }] },
+    })
+  );
+
+  const env = { ...process.env, CURSOR_TRACE_ID: 'trace-abc' };
+  await execFileAsync(process.execPath, [BIN, 'init'], { cwd, env });
+
+  // Claude Code settings are still written alongside the Cursor hooks.
+  assert.ok(existsSync(join(cwd, '.claude', 'settings.json')));
+
+  const config = JSON.parse(readFileSync(join(cwd, '.cursor', 'hooks.json'), 'utf8'));
+  assert.equal(config.version, 1);
+  assert.equal(config.hooks.stop[0].command, 'echo done');
+  assert.match(config.hooks.stop[1].command, /ari-hooks hook stop/);
+  assert.match(config.hooks.sessionStart[0].command, /ari-hooks hook session-start/);
+  assert.match(config.hooks.beforeSubmitPrompt[0].command, /ari-hooks hook user-prompt-submit/);
+  assert.match(config.hooks.afterAgentResponse[0].command, /ari-hooks hook agent-response/);
+
+  // Second run adds nothing.
+  await execFileAsync(process.execPath, [BIN, 'init'], { cwd, env });
+  const again = JSON.parse(readFileSync(join(cwd, '.cursor', 'hooks.json'), 'utf8'));
+  assert.equal(again.hooks.stop.length, 2);
+  assert.equal(again.hooks.beforeSubmitPrompt.length, 1);
+
+  // Uninstall strips only the ari-hooks entries from both files.
+  await execFileAsync(process.execPath, [BIN, 'uninstall'], { cwd, env });
+  const cleaned = JSON.parse(readFileSync(join(cwd, '.cursor', 'hooks.json'), 'utf8'));
+  assert.deepEqual(cleaned, { version: 1, hooks: { stop: [{ command: 'echo done' }] } });
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(cwd, '.claude', 'settings.json'), 'utf8')),
+    {}
+  );
+});
+
+test('init outside Cursor leaves .cursor alone', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'ari-hooks-nocursor-init-'));
+  // Empty strings are falsy: simulates a terminal that is not inside Cursor
+  // even when the test runner itself is.
+  const env = { ...process.env, CURSOR_TRACE_ID: '', CURSOR_AGENT: '' };
+  await execFileAsync(process.execPath, [BIN, 'init'], { cwd, env });
+  assert.ok(existsSync(join(cwd, '.claude', 'settings.json')));
+  assert.ok(!existsSync(join(cwd, '.cursor')));
+});
+
 test('uninstall removes only the ari-hooks entries and is safe to re-run', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'ari-hooks-uninstall-'));
   mkdirSync(join(cwd, '.claude'));
@@ -270,6 +322,35 @@ test('stop falls back to the pre-tool narration when the flush never settles', a
   assert.equal(received[0].outcome, 'Now running verification as required.');
 });
 
+// Cursor hooks send conversation_id (not session_id) and no parseable
+// transcript; afterAgentResponse hands us the assistant text instead.
+test('cursor payloads: prompt + agent-response + stop send request/outcome', async () => {
+  const { home, received, server } = await stopTestSetup();
+  const base = {
+    conversation_id: 'conv-42',
+    cursor_version: '1.7.0',
+    workspace_roots: ['/tmp/cursor-project'],
+    transcript_path: null,
+  };
+
+  await runHook('user-prompt-submit', { ...base, prompt: 'Fix the login bug' }, home);
+  assert.ok(existsSync(join(home, 'sessions', 'conv-42.json')));
+
+  // Fires per assistant message; the last text wins as the outcome.
+  await runHook('agent-response', { ...base, text: 'Looking into it.' }, home);
+  await runHook('agent-response', { ...base, text: 'Fixed the login bug in auth.ts.' }, home);
+
+  await runHook('stop', { ...base, status: 'completed', loop_count: 0 }, home);
+  server.close();
+
+  assert.equal(received.length, 1);
+  assert.equal(received[0].request, 'Fix the login bug');
+  assert.equal(received[0].outcome, 'Fixed the login bug in auth.ts.');
+  assert.equal(received[0].session_id, 'conv-42');
+  assert.equal(received[0].cwd, '/tmp/cursor-project');
+  assert.ok(!existsSync(join(home, 'sessions', 'conv-42.json')));
+});
+
 test('install sets up hooks (skipping login when a token exists); bare command just prints usage', async () => {
   const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));
   const cwd = mkdtempSync(join(tmpdir(), 'ari-hooks-install-'));
@@ -374,6 +455,45 @@ test('session-start fetches /agent-tasks and emits a visible list plus context',
     output.hookSpecificOutput.additionalContext,
     /Look at the open bug reports and triage them\./
   );
+});
+
+test('session-start from Cursor emits flat additional_context and skips background agents', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));
+
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        tasks: [{ taskName: 'Triage new bug reports', prompt: 'Look at the open bug reports.' }],
+      })
+    );
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  writeFileSync(
+    join(home, 'config.json'),
+    JSON.stringify({ token: 'ari_testtoken', apiUrl: `http://127.0.0.1:${server.address().port}` })
+  );
+
+  const cursorInput = {
+    conversation_id: 'conv-1',
+    session_id: 'sess-1',
+    cursor_version: '1.7.0',
+    composer_mode: 'agent',
+    is_background_agent: false,
+  };
+  const { stdout } = await runHook('session-start', cursorInput, home);
+
+  const output = JSON.parse(stdout);
+  // Cursor's sessionStart output shape: no systemMessage/hookSpecificOutput.
+  assert.equal(output.systemMessage, undefined);
+  assert.equal(output.hookSpecificOutput, undefined);
+  assert.match(output.additional_context, /Triage new bug reports/);
+  assert.match(output.additional_context, /Look at the open bug reports\./);
+
+  // Headless background agents get nothing — no user to pick a task.
+  const bg = await runHook('session-start', { ...cursorInput, is_background_agent: true }, home);
+  assert.equal(bg.stdout, '');
+  server.close();
 });
 
 test('session-start is a silent no-op on compact, without a token, or with no tasks', async () => {

@@ -7,9 +7,11 @@ const USAGE = `ari-hooks — share your Claude Code activity with Ari
 
 Usage:
   ari-hooks install      Log in (if needed) and set up hooks in the current folder
-  ari-hooks uninstall    Remove the hooks from ./.claude/settings.json
+                         (inside Cursor, also writes ./.cursor/hooks.json)
+  ari-hooks uninstall    Remove the hooks from ./.claude/settings.json and
+                         ./.cursor/hooks.json
   ari-hooks login        Log in via the browser and store an API token
-  ari-hooks init         Just add the hooks to ./.claude/settings.json (no login)
+  ari-hooks init         Just add the hooks (no login)
   ari-hooks config       Show the configured URLs and login state
   ari-hooks status       Show login state
   ari-hooks logout       Remove the stored token

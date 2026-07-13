@@ -58,15 +58,39 @@ function saveSession(sessionId, session) {
   writeFileSync(sessionPath(sessionId), JSON.stringify(session));
 }
 
+// Claude Code identifies the session as session_id; Cursor hooks send
+// conversation_id (their sessionStart also has a session_id, but the other
+// events do not, so the conversation is our stable per-turn key).
+const sessionIdOf = (input) => input.session_id ?? input.conversation_id;
+
+// Every Cursor hook payload carries cursor_version; Claude Code's never do.
+const isCursorInput = (input) => typeof input.cursor_version === 'string';
+
 /**
- * UserPromptSubmit: remember the prompt so the Stop hook can pair it with
- * the turn's outcome.
+ * UserPromptSubmit (Claude Code) / beforeSubmitPrompt (Cursor): remember the
+ * prompt so the Stop hook can pair it with the turn's outcome. Both hosts
+ * put the text in `prompt`.
  */
 async function onUserPromptSubmit(input) {
-  if (!input.session_id || typeof input.prompt !== 'string') return;
-  const session = loadSession(input.session_id);
+  const sessionId = sessionIdOf(input);
+  if (!sessionId || typeof input.prompt !== 'string') return;
+  const session = loadSession(sessionId);
   session.prompts.push(input.prompt);
-  saveSession(input.session_id, session);
+  saveSession(sessionId, session);
+}
+
+/**
+ * afterAgentResponse (Cursor only): Cursor's transcript is not the Claude
+ * Code JSONL that extractOutcome can parse, so capture the final assistant
+ * text as Cursor hands it to us. Fires once per assistant message; the last
+ * one before stop is the turn's outcome.
+ */
+async function onAgentResponse(input) {
+  const sessionId = sessionIdOf(input);
+  if (!sessionId || typeof input.text !== 'string' || !input.text.trim()) return;
+  const session = loadSession(sessionId);
+  session.outcome = input.text;
+  saveSession(sessionId, session);
 }
 
 function assistantText(entry) {
@@ -138,20 +162,25 @@ async function onStop(input) {
   // stop_hook_active means a stop hook already forced Claude to continue;
   // the real end of the turn will fire another Stop event.
   if (input.stop_hook_active) return;
-  if (!input.session_id || !input.transcript_path) return;
+  const sessionId = sessionIdOf(input);
+  if (!sessionId) return;
 
-  const session = loadSession(input.session_id);
+  const session = loadSession(sessionId);
   if (session.prompts.length === 0) return;
 
-  // Wait for the final assistant message to land in the transcript; on
-  // timeout fall back to the last text we did find (best effort).
-  const deadline = Date.now() + OUTCOME_SETTLE_TIMEOUT_MS;
-  let outcome;
-  for (;;) {
-    const { text, settled } = extractOutcome(input.transcript_path);
-    outcome = text;
-    if (settled || Date.now() >= deadline) break;
-    await sleep(OUTCOME_POLL_INTERVAL_MS);
+  // Cursor sessions get the outcome pushed to us via afterAgentResponse;
+  // Claude Code sessions read it from the transcript, waiting for the final
+  // assistant message to land there (on timeout, fall back to the last text
+  // we did find — best effort).
+  let outcome = session.outcome ?? null;
+  if (!outcome && input.transcript_path) {
+    const deadline = Date.now() + OUTCOME_SETTLE_TIMEOUT_MS;
+    for (;;) {
+      const { text, settled } = extractOutcome(input.transcript_path);
+      outcome = text;
+      if (settled || Date.now() >= deadline) break;
+      await sleep(OUTCOME_POLL_INTERVAL_MS);
+    }
   }
   if (!outcome) return;
 
@@ -167,8 +196,9 @@ async function onStop(input) {
     body: JSON.stringify({
       request: clamp(session.prompts.join('\n\n')),
       outcome: clamp(outcome),
-      session_id: input.session_id,
-      cwd: input.cwd ?? process.cwd(),
+      session_id: sessionId,
+      // Cursor sends workspace_roots instead of cwd.
+      cwd: input.cwd ?? input.workspace_roots?.[0] ?? process.cwd(),
     }),
     signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
   });
@@ -176,7 +206,7 @@ async function onStop(input) {
     throw new Error(`POST /agent-activities failed: ${response.status}`);
   }
 
-  rmSync(sessionPath(input.session_id), { force: true });
+  rmSync(sessionPath(sessionId), { force: true });
 }
 
 const MAX_TASKS = 3;
@@ -195,6 +225,9 @@ async function onSessionStart(input) {
   // Compaction restarts the session mid-conversation; the tasks were
   // already offered, so don't show (or inject) them again.
   if (input.source === 'compact') return;
+  // Cursor also fires sessionStart for headless background agents — there is
+  // no user watching who could pick a task.
+  if (input.is_background_agent) return;
 
   const config = loadConfig();
   if (!config.token) return;
@@ -222,6 +255,36 @@ async function onSessionStart(input) {
     .slice(0, MAX_TASKS);
   if (tasks.length === 0) return;
 
+  const additionalContext =
+    `The user has Ari connected via ari-hooks. At session start the user was ` +
+    `shown this list of suggested tasks:\n\n` +
+    tasks
+      .map(
+        (t, i) =>
+          `Task ${i + 1}: ${oneLine(t.taskName)}\nPrompt: ${clamp(t.prompt)}`
+      )
+      .join('\n\n') +
+    `\n\nIf the user asks to run one of these tasks (by number or name), ` +
+    `carry out that task's prompt as if the user had typed it. Do not start ` +
+    `any of these tasks unless the user asks.`;
+
+  // Cursor's sessionStart output is a flat { additional_context } and it has
+  // no user-visible systemMessage channel, so the agent itself must surface
+  // the list.
+  if (isCursorInput(input)) {
+    writeSync(
+      1,
+      JSON.stringify({
+        additional_context:
+          additionalContext +
+          `\n\nNote: unlike Claude Code, Cursor did NOT show the user this ` +
+          `list — briefly offer these tasks by name at the start of your ` +
+          `first reply.`,
+      }) + '\n'
+    );
+    return;
+  }
+
   // Claude Code renders systemMessage with ANSI intact; the leading \n
   // pushes our block below the fixed "SessionStart:<source> says:" prefix.
   const BOLD = '\x1b[1m';
@@ -235,19 +298,6 @@ async function onSessionStart(input) {
     `\n${BOLD}${CYAN}✻ Ari — things Claude can take care of for you right now${RESET}\n` +
     `${visibleList}\n` +
     `${GREY}Reply "run task 1" (or the task name) to start one.${RESET}`;
-
-  const additionalContext =
-    `The user has Ari connected via ari-hooks. At session start the user was ` +
-    `shown this list of suggested tasks:\n\n` +
-    tasks
-      .map(
-        (t, i) =>
-          `Task ${i + 1}: ${oneLine(t.taskName)}\nPrompt: ${clamp(t.prompt)}`
-      )
-      .join('\n\n') +
-    `\n\nIf the user asks to run one of these tasks (by number or name), ` +
-    `carry out that task's prompt as if the user had typed it. Do not start ` +
-    `any of these tasks unless the user asks.`;
 
   // writeSync: process.exit(0) in runHook would race an async stdout write.
   writeSync(
@@ -273,6 +323,8 @@ export async function runHook(event) {
     const input = raw ? JSON.parse(raw) : {};
     if (event === 'user-prompt-submit') {
       await onUserPromptSubmit(input);
+    } else if (event === 'agent-response') {
+      await onAgentResponse(input);
     } else if (event === 'stop') {
       await onStop(input);
     } else if (event === 'session-start') {

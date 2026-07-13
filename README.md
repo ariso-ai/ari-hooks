@@ -33,12 +33,29 @@ That single command:
 
 Existing settings and hooks are preserved; running it again is a no-op.
 
+### Cursor
+
+Cursor's agent doesn't read `.claude/settings.json` — it has its own hooks
+system in `.cursor/hooks.json`. When `ari-hooks install` (or `init`) runs
+inside Cursor (detected via the `CURSOR_TRACE_ID` / `CURSOR_AGENT`
+environment variables Cursor sets in its terminal and CLI agent), it also
+writes the equivalent hooks there:
+
+- `sessionStart` — injects Ari's suggested tasks as agent context
+- `beforeSubmitPrompt` — records what you asked for
+- `afterAgentResponse` — captures the final assistant text (Cursor's
+  transcript isn't the Claude Code format, so the outcome is taken from
+  this event instead)
+- `stop` — sends the request/outcome pair to the Ari API
+
+`ari-hooks uninstall` cleans up both files, wherever it runs.
+
 ### Commands
 
 | Command | What it does |
 |---|---|
 | `ari-hooks install` | Login (if needed) + set up hooks in the current folder |
-| `ari-hooks uninstall` | Remove the hooks from `./.claude/settings.json` |
+| `ari-hooks uninstall` | Remove the hooks from `./.claude/settings.json` and `./.cursor/hooks.json` |
 | `ari-hooks login` | Browser login, stores the API token |
 | `ari-hooks init` | Just add the hooks to `./.claude/settings.json` (no login) |
 | `ari-hooks config` | Show configured URLs and login state |
