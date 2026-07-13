@@ -12,7 +12,7 @@ import {
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 
 const SUCCESS_HTML = `<!doctype html>
-<html><head><title>Ari Hooks</title></head>
+<html><head><meta charset="utf-8"><title>Ari Hooks</title></head>
 <body style="font-family: sans-serif; text-align: center; padding-top: 4rem;">
 <h2>✓ Logged in</h2>
 <p>The Ari Hooks CLI received your token. You can close this window.</p>
@@ -36,7 +36,7 @@ function openBrowser(url) {
 
 /**
  * Browser login: start a one-shot loopback HTTP server, send the user to
- * the web app's /cli-auth page with our callback URL, and wait for the
+ * the web app's /cli-auth page with our callback port, and wait for the
  * page to redirect back with a freshly minted API token.
  */
 export async function login() {
@@ -45,7 +45,7 @@ export async function login() {
 
   const token = await new Promise((resolve, reject) => {
     const server = createServer((req, res) => {
-      const url = new URL(req.url, 'http://127.0.0.1');
+      const url = new URL(req.url, 'http://localhost');
       if (url.pathname !== '/callback') {
         res.writeHead(404).end();
         return;
@@ -59,20 +59,20 @@ export async function login() {
         res.writeHead(400).end('Missing token.');
         return;
       }
-      res.writeHead(200, { 'Content-Type': 'text/html' }).end(SUCCESS_HTML);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }).end(SUCCESS_HTML);
       // Let the response flush before tearing the server down.
       setTimeout(() => server.close(), 100);
       resolve(received);
     });
 
     server.on('error', reject);
+    // Bind to 127.0.0.1 explicitly — the web app reconstructs the callback
+    // as http://127.0.0.1:<port>/callback from callback_port.
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address();
       const authUrl = new URL('/cli-auth', getWebUrl(config));
-      authUrl.searchParams.set(
-        'callback',
-        `http://127.0.0.1:${port}/callback`
-      );
+      // Pass only the port; the full callback URL trips the WAF.
+      authUrl.searchParams.set('callback_port', String(port));
       authUrl.searchParams.set('state', state);
 
       console.log('Opening your browser to log in to Ari...');
