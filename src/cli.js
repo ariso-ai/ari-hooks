@@ -6,13 +6,16 @@ import { loadConfig, setUrls, showConfig } from './config.js';
 const USAGE = `ari-hooks — share your Claude Code activity with Ari
 
 Usage:
-  ari-hooks install      Log in (if needed) and set up hooks; asks whether to
-                         install for just this repo (and then just for you —
-                         .claude/settings.local.json — or everyone on the repo —
-                         .claude/settings.json) or machine-wide
-                         (inside Cursor, also writes ./.cursor/hooks.json)
+  ari-hooks install      Log in (if needed) and set up hooks. Detects which
+                         coding agents you use (Claude Code, Codex, Cursor) and
+                         wires up each one; asks whether to install for just this
+                         repo (and then just for you — .claude/settings.local.json
+                         — or everyone on the repo — .claude/settings.json) or
+                         machine-wide. Codex hooks go in ./.codex/hooks.json (or
+                         ~/.codex/hooks.json), Cursor's in ./.cursor/hooks.json
   ari-hooks uninstall    Remove the hooks from ./.claude/settings.json,
                          ./.claude/settings.local.json, ~/.claude/settings.json,
+                         ./.codex/hooks.json, ~/.codex/hooks.json,
                          and ./.cursor/hooks.json
   ari-hooks login        Log in via the browser and store an API token
   ari-hooks init         Just add the hooks (no login)
@@ -37,6 +40,7 @@ function parseFlags(args) {
     if (args[i] === '--web-url') flags.webUrl = args[++i];
     else if (args[i] === '--api-url') flags.apiUrl = args[++i];
     else if (args[i] === '--reset-urls') flags.resetUrls = true;
+    else if (args[i] === '--agent') flags.agent = args[++i];
     else rest.push(args[i]);
   }
   return { flags, rest };
@@ -84,7 +88,7 @@ export async function main(argv) {
       uninstall();
       return;
     case 'hook':
-      await runHook(rest[1]);
+      await runHook(rest[1], flags.agent);
       return;
     case undefined:
       // URL-only invocations (e.g. `ari-hooks --web-url ...`) are a

@@ -1,12 +1,28 @@
 import { dirname, join } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline/promises';
 
+// Each command carries an --agent flag so the Stop hook can report which coding
+// agent produced the activity (agent_name) without having to guess from the
+// payload — the config file it lives in is the reliable source of that fact.
 const HOOK_EVENTS = {
-  SessionStart: 'ari-hooks hook session-start',
-  UserPromptSubmit: 'ari-hooks hook user-prompt-submit',
-  Stop: 'ari-hooks hook stop',
+  SessionStart: 'ari-hooks hook session-start --agent claude',
+  UserPromptSubmit: 'ari-hooks hook user-prompt-submit --agent claude',
+  Stop: 'ari-hooks hook stop --agent claude',
+};
+
+// Codex copied Claude Code's hooks design: the same { hooks: { Event: [{ hooks:
+// [{ type, command }] }] } } shape and the same event names, read from
+// .codex/hooks.json (or ~/.codex/hooks.json). We only wire up the
+// activity-sharing pair: UserPromptSubmit remembers the prompt and Stop ships
+// the outcome (Codex hands us the final text on the Stop payload as
+// last_assistant_message — no transcript to parse; see onStop). We skip
+// SessionStart because Codex has no user-visible channel to render the
+// suggested-task list, so there is nothing to show.
+const CODEX_HOOK_EVENTS = {
+  UserPromptSubmit: 'ari-hooks hook user-prompt-submit --agent codex',
+  Stop: 'ari-hooks hook stop --agent codex',
 };
 
 // Cursor's agent doesn't read .claude/settings.json — it has its own hooks
@@ -14,10 +30,10 @@ const HOOK_EVENTS = {
 // format. Cursor's transcript is not the Claude Code JSONL our stop handler
 // parses, so afterAgentResponse captures the final assistant text instead.
 const CURSOR_HOOK_EVENTS = {
-  sessionStart: 'ari-hooks hook session-start',
-  beforeSubmitPrompt: 'ari-hooks hook user-prompt-submit',
-  afterAgentResponse: 'ari-hooks hook agent-response',
-  stop: 'ari-hooks hook stop',
+  sessionStart: 'ari-hooks hook session-start --agent cursor',
+  beforeSubmitPrompt: 'ari-hooks hook user-prompt-submit --agent cursor',
+  afterAgentResponse: 'ari-hooks hook agent-response --agent cursor',
+  stop: 'ari-hooks hook stop --agent cursor',
 };
 
 // Cursor's app install shows up in the env vars its integrated terminal
@@ -48,6 +64,37 @@ export const isCursor = (env = process.env) =>
       CURSOR_PATH_VARS.some((key) => /cursor/i.test(env[key] ?? ''))
   );
 
+const dirExists = (path) => {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+};
+
+// Each agent keeps its config under a home directory whose presence is the
+// tell that the user runs that agent; both honor the same env overrides the
+// agents themselves do (CLAUDE_CONFIG_DIR, CODEX_HOME), which also lets tests
+// point them at a scratch dir.
+const claudeHome = (env) => env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+const codexHome = (env) => env.CODEX_HOME || join(homedir(), '.codex');
+
+/**
+ * Which coding agents does this user run? Claude Code and Codex are detected by
+ * their config directory; Cursor by the marks it leaves in an integrated
+ * terminal (see isCursor). Returns a Set so install can branch to one config
+ * path per detected agent. Falls back to Claude Code when nothing is found so a
+ * fresh machine (or CI) still gets the primary target wired up.
+ */
+export function detectAgents(env = process.env) {
+  const agents = new Set();
+  if (dirExists(claudeHome(env))) agents.add('claude');
+  if (dirExists(codexHome(env))) agents.add('codex');
+  if (isCursor(env)) agents.add('cursor');
+  if (agents.size === 0) agents.add('claude');
+  return agents;
+}
+
 function readJson(path) {
   try {
     return JSON.parse(readFileSync(path, 'utf8'));
@@ -72,19 +119,36 @@ const writeJson = (path, value) =>
  */
 function claudeSettingsPath(scope, cwd, env) {
   if (scope === 'user') {
-    return join(env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'settings.json');
+    return join(claudeHome(env), 'settings.json');
   }
   const file = scope === 'local' ? 'settings.local.json' : 'settings.json';
   return join(cwd, '.claude', file);
 }
 
-function initClaude(settingsPath) {
+// Codex has one project file and one user file — no committed/private split
+// like Claude Code's settings.local.json — so 'local' collapses onto the
+// project file.
+function codexHooksPath(scope, cwd, env) {
+  if (scope === 'user') {
+    return join(codexHome(env), 'hooks.json');
+  }
+  return join(cwd, '.codex', 'hooks.json');
+}
+
+/**
+ * Merge the ari-hooks commands into a settings file that uses the shared
+ * Claude Code / Codex nested hook shape ({ hooks: { Event: [{ hooks: [...] }] }
+ * }). Idempotent: an event that already has an ari-hooks command is left alone,
+ * everything else in the file is preserved. `label` tags the success line so
+ * the user can tell which agent a file belongs to.
+ */
+function initNestedHooks(settingsPath, events, label) {
   const settings = readJson(settingsPath) ?? {};
 
   settings.hooks ??= {};
   let changed = false;
 
-  for (const [event, command] of Object.entries(HOOK_EVENTS)) {
+  for (const [event, command] of Object.entries(events)) {
     settings.hooks[event] ??= [];
     const already = settings.hooks[event].some((matcher) =>
       (matcher.hooks ?? []).some((h) => h.command?.includes('ari-hooks hook'))
@@ -103,9 +167,14 @@ function initClaude(settingsPath) {
 
   mkdirSync(dirname(settingsPath), { recursive: true });
   writeJson(settingsPath, settings);
-  console.log(`✓ Ari hooks added to ${settingsPath}`);
+  console.log(`✓ Ari hooks added to ${settingsPath}${label ? ` (${label})` : ''}`);
   return true;
 }
+
+const initClaude = (settingsPath) => initNestedHooks(settingsPath, HOOK_EVENTS);
+
+const initCodex = (hooksPath) =>
+  initNestedHooks(hooksPath, CODEX_HOOK_EVENTS, 'Codex detected');
 
 function initCursor(cwd) {
   const cursorDir = join(cwd, '.cursor');
@@ -168,17 +237,22 @@ async function chooseClaudeScope() {
 }
 
 /**
- * Merge the ari-hooks hook commands into Claude Code settings — and, when
- * running inside Cursor, into .cursor/hooks.json as well. Idempotent:
- * existing ari-hooks entries are left alone, and unrelated hooks/settings
- * are preserved. `scope` picks the Claude settings file (see
- * claudeSettingsPath); the Cursor hooks file is always project-level.
+ * Merge the ari-hooks hook commands into the config of every coding agent this
+ * user runs (see detectAgents): Claude Code settings, Codex hooks.json, and —
+ * inside Cursor — .cursor/hooks.json. Idempotent: existing ari-hooks entries
+ * are left alone, and unrelated hooks/settings are preserved. `scope` picks the
+ * Claude Code and Codex file (see claudeSettingsPath / codexHooksPath); the
+ * Cursor hooks file is always project-level.
  */
 export function init(cwd = process.cwd(), env = process.env, scope = 'project') {
-  const changedClaude = initClaude(claudeSettingsPath(scope, cwd, env));
-  const changedCursor = isCursor(env) ? initCursor(cwd) : false;
+  const agents = detectAgents(env);
+  const changed = [
+    agents.has('claude') && initClaude(claudeSettingsPath(scope, cwd, env)),
+    agents.has('codex') && initCodex(codexHooksPath(scope, cwd, env)),
+    agents.has('cursor') && initCursor(cwd),
+  ];
 
-  if (!changedClaude && !changedCursor) return;
+  if (!changed.some(Boolean)) return;
   const where = scope === 'user' ? 'on this machine' : 'in this folder';
   console.log(
     `Agent sessions ${where} will now share each request and its outcome with Ari,`
@@ -187,11 +261,14 @@ export function init(cwd = process.cwd(), env = process.env, scope = 'project') 
 }
 
 /**
- * The `install` flavor of init: when attached to a terminal, ask where the
- * Claude Code hooks should live before writing them. Non-interactive runs
- * (CI, piped stdin) keep the old default of ./.claude/settings.json.
+ * The `install` flavor of init: report which agents were detected, and — when
+ * attached to a terminal — ask where the hooks should live before writing them.
+ * Non-interactive runs (CI, piped stdin) keep the old default of the
+ * project-level files.
  */
 export async function install(cwd = process.cwd(), env = process.env) {
+  const agents = detectAgents(env);
+  console.log(`Detected coding agent(s): ${[...agents].join(', ')}`);
   const scope =
     process.stdin.isTTY && process.stdout.isTTY
       ? await chooseClaudeScope()
@@ -199,7 +276,7 @@ export async function install(cwd = process.cwd(), env = process.env) {
   init(cwd, env, scope);
 }
 
-function uninstallClaude(settingsPath) {
+function uninstallNestedHooks(settingsPath) {
   if (!existsSync(settingsPath)) return false;
   const settings = readJson(settingsPath);
 
@@ -256,20 +333,24 @@ function uninstallCursor(cwd) {
 }
 
 /**
- * Remove the ari-hooks hook commands that init/install added to the
- * Claude Code settings and Cursor hooks file. The inverse of init: only
- * ari-hooks entries are touched, everything else in the files is
- * preserved. Cleans every location install can write to (project
- * settings.json, settings.local.json, the user-level settings, and the
- * Cursor hooks file), so hooks don't linger wherever they were put.
+ * Remove the ari-hooks hook commands that init/install added to the Claude
+ * Code settings, Codex hooks.json, and Cursor hooks file. The inverse of init:
+ * only ari-hooks entries are touched, everything else in the files is
+ * preserved. Cleans every location install can write to — regardless of which
+ * agents are currently detected — so hooks don't linger wherever they were put:
+ * the project/local/user Claude settings, the project and user Codex hooks, and
+ * the Cursor hooks file.
  */
 export function uninstall(cwd = process.cwd(), env = process.env) {
   const removedClaude = ['project', 'local', 'user']
-    .map((scope) => uninstallClaude(claudeSettingsPath(scope, cwd, env)))
+    .map((scope) => uninstallNestedHooks(claudeSettingsPath(scope, cwd, env)))
+    .some(Boolean);
+  const removedCodex = ['project', 'user']
+    .map((scope) => uninstallNestedHooks(codexHooksPath(scope, cwd, env)))
     .some(Boolean);
   const removedCursor = uninstallCursor(cwd);
 
-  if (!removedClaude && !removedCursor) {
+  if (!removedClaude && !removedCodex && !removedCursor) {
     console.log('No Ari hooks found in this folder — nothing to remove.');
     return;
   }

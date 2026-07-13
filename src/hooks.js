@@ -66,6 +66,21 @@ const sessionIdOf = (input) => input.session_id ?? input.conversation_id;
 // Every Cursor hook payload carries cursor_version; Claude Code's never do.
 const isCursorInput = (input) => typeof input.cursor_version === 'string';
 
+// agent_type values, keyed by the --agent slug the hook command passes (init
+// bakes it into each agent's config file).
+const AGENT_TYPES = { claude: 'claude-code', codex: 'codex', cursor: 'cursor' };
+
+// Which coding agent produced this turn. The --agent flag from the hook command
+// is the reliable source; fall back to sniffing the payload for installs that
+// predate the flag — Cursor stamps cursor_version, Claude Code sends a
+// transcript_path, and Codex has neither (it hands us last_assistant_message).
+function agentTypeOf(input, agent) {
+  if (AGENT_TYPES[agent]) return AGENT_TYPES[agent];
+  if (isCursorInput(input)) return 'cursor';
+  if (input.transcript_path) return 'claude-code';
+  return 'codex';
+}
+
 /**
  * UserPromptSubmit (Claude Code) / beforeSubmitPrompt (Cursor): remember the
  * prompt so the Stop hook can pair it with the turn's outcome. Both hosts
@@ -158,7 +173,7 @@ const clamp = (text) =>
  * Stop: the turn is over — send the accumulated request(s) plus the final
  * assistant message to Ari, then clear the per-session state.
  */
-async function onStop(input) {
+async function onStop(input, agent) {
   // stop_hook_active means a stop hook already forced Claude to continue;
   // the real end of the turn will fire another Stop event.
   if (input.stop_hook_active) return;
@@ -168,11 +183,12 @@ async function onStop(input) {
   const session = loadSession(sessionId);
   if (session.prompts.length === 0) return;
 
-  // Cursor sessions get the outcome pushed to us via afterAgentResponse;
-  // Claude Code sessions read it from the transcript, waiting for the final
-  // assistant message to land there (on timeout, fall back to the last text
-  // we did find — best effort).
-  let outcome = session.outcome ?? null;
+  // Cursor sessions get the outcome pushed to us via afterAgentResponse; Codex
+  // hands us the final text directly on the Stop payload as
+  // last_assistant_message; Claude Code sessions read it from the transcript,
+  // waiting for the final assistant message to land there (on timeout, fall
+  // back to the last text we did find — best effort).
+  let outcome = session.outcome ?? input.last_assistant_message ?? null;
   if (!outcome && input.transcript_path) {
     const deadline = Date.now() + OUTCOME_SETTLE_TIMEOUT_MS;
     for (;;) {
@@ -197,6 +213,7 @@ async function onStop(input) {
       request: clamp(session.prompts.join('\n\n')),
       outcome: clamp(outcome),
       session_id: sessionId,
+      agent_type: agentTypeOf(input, agent),
       // Cursor sends workspace_roots instead of cwd.
       cwd: input.cwd ?? input.workspace_roots?.[0] ?? process.cwd(),
     }),
@@ -317,7 +334,7 @@ async function onSessionStart(input) {
  * user's Claude Code session: all failures are swallowed (logged to
  * ~/.ari-hooks/error.log) and we always exit 0.
  */
-export async function runHook(event) {
+export async function runHook(event, agent) {
   try {
     const raw = await readStdin();
     const input = raw ? JSON.parse(raw) : {};
@@ -326,7 +343,7 @@ export async function runHook(event) {
     } else if (event === 'agent-response') {
       await onAgentResponse(input);
     } else if (event === 'stop') {
-      await onStop(input);
+      await onStop(input, agent);
     } else if (event === 'session-start') {
       await onSessionStart(input);
     }
