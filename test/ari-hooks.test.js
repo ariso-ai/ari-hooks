@@ -351,6 +351,41 @@ test('cursor payloads: prompt + agent-response + stop send request/outcome', asy
   assert.ok(!existsSync(join(home, 'sessions', 'conv-42.json')));
 });
 
+// The interactive scope prompts only fire on a TTY (covered by install's
+// chooseClaudeScope); here we drive init with each scope directly.
+test('init scopes: local writes settings.local.json, user writes to CLAUDE_CONFIG_DIR', async (t) => {
+  const { init, uninstall } = await import('../src/init.js');
+  const silence = () => {};
+  t.mock.method(console, 'log', silence);
+
+  const cwd = mkdtempSync(join(tmpdir(), 'ari-hooks-scope-'));
+  const configDir = mkdtempSync(join(tmpdir(), 'ari-hooks-user-claude-'));
+  const env = { CLAUDE_CONFIG_DIR: configDir, CURSOR_TRACE_ID: '', CURSOR_AGENT: '' };
+
+  init(cwd, env, 'local');
+  const local = JSON.parse(
+    readFileSync(join(cwd, '.claude', 'settings.local.json'), 'utf8')
+  );
+  assert.match(local.hooks.Stop[0].hooks[0].command, /ari-hooks hook stop/);
+  // The shared project file is untouched.
+  assert.ok(!existsSync(join(cwd, '.claude', 'settings.json')));
+
+  init(cwd, env, 'user');
+  const user = JSON.parse(readFileSync(join(configDir, 'settings.json'), 'utf8'));
+  assert.match(user.hooks.SessionStart[0].hooks[0].command, /ari-hooks hook session-start/);
+
+  // Uninstall sweeps every scope install can write to.
+  uninstall(cwd, env);
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(cwd, '.claude', 'settings.local.json'), 'utf8')),
+    {}
+  );
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(configDir, 'settings.json'), 'utf8')),
+    {}
+  );
+});
+
 test('install sets up hooks (skipping login when a token exists); bare command just prints usage', async () => {
   const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));
   const cwd = mkdtempSync(join(tmpdir(), 'ari-hooks-install-'));

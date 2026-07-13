@@ -1,5 +1,7 @@
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { createInterface } from 'node:readline/promises';
 
 const HOOK_EVENTS = {
   SessionStart: 'ari-hooks hook session-start',
@@ -39,9 +41,23 @@ function readJson(path) {
 const writeJson = (path, value) =>
   writeFileSync(path, JSON.stringify(value, null, 2) + '\n');
 
-function initClaude(cwd) {
-  const claudeDir = join(cwd, '.claude');
-  const settingsPath = join(claudeDir, 'settings.json');
+/**
+ * Where the Claude Code hooks land, by scope:
+ *   project — ./.claude/settings.json        (shared with everyone on the repo)
+ *   local   — ./.claude/settings.local.json  (just this user; Claude Code
+ *             gitignores it)
+ *   user    — ~/.claude/settings.json        (every repo on this machine;
+ *             honors CLAUDE_CONFIG_DIR like Claude Code does)
+ */
+function claudeSettingsPath(scope, cwd, env) {
+  if (scope === 'user') {
+    return join(env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'settings.json');
+  }
+  const file = scope === 'local' ? 'settings.local.json' : 'settings.json';
+  return join(cwd, '.claude', file);
+}
+
+function initClaude(settingsPath) {
   const settings = readJson(settingsPath) ?? {};
 
   settings.hooks ??= {};
@@ -64,7 +80,7 @@ function initClaude(cwd) {
     return false;
   }
 
-  mkdirSync(claudeDir, { recursive: true });
+  mkdirSync(dirname(settingsPath), { recursive: true });
   writeJson(settingsPath, settings);
   console.log(`✓ Ari hooks added to ${settingsPath}`);
   return true;
@@ -100,25 +116,69 @@ function initCursor(cwd) {
   return true;
 }
 
+async function ask(question) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return (await rl.question(question)).trim().toLowerCase();
+  } catch {
+    // Ctrl+D / closed stdin — fall through to the question's default.
+    return '';
+  } finally {
+    rl.close();
+  }
+}
+
 /**
- * Merge the ari-hooks hook commands into the project's Claude Code
- * settings (.claude/settings.json in cwd) — and, when running inside
- * Cursor, into .cursor/hooks.json as well. Idempotent: existing ari-hooks
- * entries are left alone, and unrelated hooks/settings are preserved.
+ * Interactive scope picker for the Claude Code hooks: repo-only or
+ * machine-wide, and — when repo-only — private (settings.local.json) or
+ * shared with everyone on the repo (settings.json).
  */
-export function init(cwd = process.cwd(), env = process.env) {
-  const changedClaude = initClaude(cwd);
+async function chooseClaudeScope() {
+  const repoOnly = await ask('Install hooks just for this repo? [Y/n] ');
+  if (repoOnly === 'n' || repoOnly === 'no') return 'user';
+
+  const who = await ask(
+    'Install just for yourself, or for everyone who works on this repo?\n' +
+      '  1) Just me   (.claude/settings.local.json, not committed)\n' +
+      '  2) Everyone  (.claude/settings.json, committed with the repo)\n' +
+      'Choose [1/2] (default 1): '
+  );
+  return who === '2' || who === 'everyone' ? 'project' : 'local';
+}
+
+/**
+ * Merge the ari-hooks hook commands into Claude Code settings — and, when
+ * running inside Cursor, into .cursor/hooks.json as well. Idempotent:
+ * existing ari-hooks entries are left alone, and unrelated hooks/settings
+ * are preserved. `scope` picks the Claude settings file (see
+ * claudeSettingsPath); the Cursor hooks file is always project-level.
+ */
+export function init(cwd = process.cwd(), env = process.env, scope = 'project') {
+  const changedClaude = initClaude(claudeSettingsPath(scope, cwd, env));
   const changedCursor = isCursor(env) ? initCursor(cwd) : false;
 
   if (!changedClaude && !changedCursor) return;
+  const where = scope === 'user' ? 'on this machine' : 'in this folder';
   console.log(
-    'Agent sessions in this folder will now share each request and its outcome with Ari,'
+    `Agent sessions ${where} will now share each request and its outcome with Ari,`
   );
   console.log('and show suggested Ari tasks when a session starts.');
 }
 
-function uninstallClaude(cwd) {
-  const settingsPath = join(cwd, '.claude', 'settings.json');
+/**
+ * The `install` flavor of init: when attached to a terminal, ask where the
+ * Claude Code hooks should live before writing them. Non-interactive runs
+ * (CI, piped stdin) keep the old default of ./.claude/settings.json.
+ */
+export async function install(cwd = process.cwd(), env = process.env) {
+  const scope =
+    process.stdin.isTTY && process.stdout.isTTY
+      ? await chooseClaudeScope()
+      : 'project';
+  init(cwd, env, scope);
+}
+
+function uninstallClaude(settingsPath) {
   if (!existsSync(settingsPath)) return false;
   const settings = readJson(settingsPath);
 
@@ -176,13 +236,16 @@ function uninstallCursor(cwd) {
 
 /**
  * Remove the ari-hooks hook commands that init/install added to the
- * project's Claude Code settings and Cursor hooks file. The inverse of
- * init: only ari-hooks entries are touched, everything else in the files
- * is preserved. Cleans both files regardless of where it runs, so hooks
- * installed from inside Cursor don't linger.
+ * Claude Code settings and Cursor hooks file. The inverse of init: only
+ * ari-hooks entries are touched, everything else in the files is
+ * preserved. Cleans every location install can write to (project
+ * settings.json, settings.local.json, the user-level settings, and the
+ * Cursor hooks file), so hooks don't linger wherever they were put.
  */
-export function uninstall(cwd = process.cwd()) {
-  const removedClaude = uninstallClaude(cwd);
+export function uninstall(cwd = process.cwd(), env = process.env) {
+  const removedClaude = ['project', 'local', 'user']
+    .map((scope) => uninstallClaude(claudeSettingsPath(scope, cwd, env)))
+    .some(Boolean);
   const removedCursor = uninstallCursor(cwd);
 
   if (!removedClaude && !removedCursor) {
