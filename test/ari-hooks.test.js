@@ -370,6 +370,36 @@ test('user-prompt-submit + stop sends request/outcome to the API', async () => {
   assert.ok(!existsSync(join(home, 'sessions', 'sess-123.json')));
 });
 
+// Claude Code delivers a background task's completion as a synthetic
+// UserPromptSubmit turn whose entire prompt is a <task-notification> block —
+// not something the user typed. It gets swapped for a short summary instead
+// of recorded verbatim.
+test('user-prompt-submit swaps synthetic task-notification prompts for a summary', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));
+  const sessionId = 'sess-notif';
+
+  const notification =
+    '<task-notification>\n<task-id>abc123</task-id>\n<status>completed</status>\n' +
+    '<summary>Background command "Run tests &amp; lint" completed (exit code 0)</summary>\n' +
+    '</task-notification>';
+  await runHook('user-prompt-submit', { session_id: sessionId, prompt: notification }, home);
+  let session = JSON.parse(readFileSync(join(home, 'sessions', `${sessionId}.json`), 'utf8'));
+  assert.deepEqual(session.prompts, [
+    'The coding agent ran a background task: Background command "Run tests & lint" completed (exit code 0)',
+  ]);
+
+  // A genuine prompt in the same session is still recorded verbatim.
+  await runHook('user-prompt-submit', { session_id: sessionId, prompt: 'Fix the login bug' }, home);
+  session = JSON.parse(readFileSync(join(home, 'sessions', `${sessionId}.json`), 'utf8'));
+  assert.equal(session.prompts[1], 'Fix the login bug');
+
+  // No <summary> block: falls back to a generic stand-in rather than the raw XML.
+  const noSummary = '<task-notification>\n<task-id>x</task-id>\n</task-notification>';
+  await runHook('user-prompt-submit', { session_id: sessionId, prompt: noSummary }, home);
+  session = JSON.parse(readFileSync(join(home, 'sessions', `${sessionId}.json`), 'utf8'));
+  assert.equal(session.prompts[2], 'The coding agent ran a background task.');
+});
+
 // Helper for the stop-hook race tests: a stub API plus a config pointing at it.
 async function stopTestSetup() {
   const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));

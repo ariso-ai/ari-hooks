@@ -81,6 +81,26 @@ function agentTypeOf(input, agent) {
   return 'codex';
 }
 
+// Claude Code auto-delivers a background task's completion as a synthetic
+// UserPromptSubmit turn — the entire prompt is a <task-notification> block,
+// not something the user typed. Recording it verbatim as a "request"
+// pollutes the activity feed with agent-internal bookkeeping, so swap it for
+// a short human-readable stand-in built from the notification's <summary>.
+const TASK_NOTIFICATION_RE = /^<task-notification>[\s\S]*<\/task-notification>$/;
+const SUMMARY_RE = /<summary>([\s\S]*?)<\/summary>/;
+const XML_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+const decodeXmlEntities = (text) =>
+  text.replace(/&(amp|lt|gt|quot|apos);/g, (_, name) => XML_ENTITIES[name]);
+
+function taskNotificationStandIn(prompt) {
+  const trimmed = prompt.trim();
+  if (!TASK_NOTIFICATION_RE.test(trimmed)) return null;
+  const summary = trimmed.match(SUMMARY_RE)?.[1]?.trim();
+  return summary
+    ? `The coding agent ran a background task: ${decodeXmlEntities(summary)}`
+    : 'The coding agent ran a background task.';
+}
+
 /**
  * UserPromptSubmit (Claude Code) / beforeSubmitPrompt (Cursor): remember the
  * prompt so the Stop hook can pair it with the turn's outcome. Both hosts
@@ -90,7 +110,7 @@ async function onUserPromptSubmit(input) {
   const sessionId = sessionIdOf(input);
   if (!sessionId || typeof input.prompt !== 'string') return;
   const session = loadSession(sessionId);
-  session.prompts.push(input.prompt);
+  session.prompts.push(taskNotificationStandIn(input.prompt) ?? input.prompt);
   saveSession(sessionId, session);
 }
 
