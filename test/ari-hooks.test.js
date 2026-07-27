@@ -400,6 +400,29 @@ test('user-prompt-submit swaps synthetic task-notification prompts for a summary
   assert.equal(session.prompts[2], 'The coding agent ran a background task.');
 });
 
+// The IDE integration injects the user's current editor selection into the
+// prompt as an <ide_selection> block. It's host-added context, not user text,
+// so it gets stripped before the prompt is recorded.
+test('user-prompt-submit strips <ide_selection> blocks from prompts', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));
+  const sessionId = 'sess-ide';
+
+  const withSelection =
+    '<ide_selection>The user selected the lines 4 to 6 from /tmp/project/auth.ts:\n' +
+    'function login() {}\n</ide_selection>\nFix the login bug';
+  await runHook('user-prompt-submit', { session_id: sessionId, prompt: withSelection }, home);
+  let session = JSON.parse(readFileSync(join(home, 'sessions', `${sessionId}.json`), 'utf8'));
+  assert.deepEqual(session.prompts, ['Fix the login bug']);
+
+  // A prompt that is nothing but the injected selection records nothing.
+  const selectionOnly =
+    '<ide_selection>The user selected the lines 1 to 2 from /tmp/project/auth.ts:\n' +
+    'const x = 1;\n</ide_selection>';
+  await runHook('user-prompt-submit', { session_id: sessionId, prompt: selectionOnly }, home);
+  session = JSON.parse(readFileSync(join(home, 'sessions', `${sessionId}.json`), 'utf8'));
+  assert.deepEqual(session.prompts, ['Fix the login bug']);
+});
+
 // Helper for the stop-hook race tests: a stub API plus a config pointing at it.
 async function stopTestSetup() {
   const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));
