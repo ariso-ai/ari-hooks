@@ -1,4 +1,5 @@
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   mkdirSync,
   readFileSync,
@@ -252,11 +253,81 @@ const MAX_TASK_NAME_LENGTH = 200;
 const oneLine = (text) =>
   text.replace(/\s+/g, ' ').trim().slice(0, MAX_TASK_NAME_LENGTH);
 
+async function fetchTasks(config) {
+  const response = await fetch(new URL('/agent-tasks', getApiUrl(config)), {
+    headers: { Authorization: `Bearer ${config.token}` },
+    signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new Error(`GET /agent-tasks failed: ${response.status}`);
+  }
+
+  const body = await response.json();
+  // The API wraps the list ({ tasks: [...] }); accept a bare array too.
+  const list = Array.isArray(body) ? body : Array.isArray(body?.tasks) ? body.tasks : [];
+  return list
+    .filter(
+      (t) =>
+        t &&
+        typeof t.taskName === 'string' &&
+        t.taskName.trim() &&
+        typeof t.prompt === 'string' &&
+        t.prompt.trim()
+    )
+    .slice(0, MAX_TASKS);
+}
+
+const NPM_PACKAGE = '@ariso-ai/ari-hooks';
+const VERSION_CHECK_TIMEOUT_MS = 3_000;
+
+const installedVersion = () =>
+  JSON.parse(
+    readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'),
+      'utf8'
+    )
+  ).version;
+
+// Plain x.y.z releases only — no prerelease/build-metadata tags to worry about.
+const isNewer = (latest, current) => {
+  const a = latest.split('.').map(Number);
+  const b = current.split('.').map(Number);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+};
+
+/**
+ * Compare the installed version against what npm has published. A stale or
+ * unreachable registry must never break session start, so any failure just
+ * skips the check (returns null, same as "up to date").
+ */
+async function checkForUpdate() {
+  try {
+    const registryUrl = process.env.ARI_HOOKS_REGISTRY_URL || 'https://registry.npmjs.org';
+    const response = await fetch(new URL(`/${NPM_PACKAGE}/latest`, registryUrl), {
+      signal: AbortSignal.timeout(VERSION_CHECK_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    const { version: latest } = await response.json();
+    const current = installedVersion();
+    return typeof latest === 'string' && isNewer(latest, current)
+      ? { current, latest }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * SessionStart: ask Ari for the top tasks Claude can take care of right now
  * and surface them at boot — a visible list for the user (systemMessage)
  * plus the full prompts for Claude (additionalContext) so it can run
- * whichever one the user picks.
+ * whichever one the user picks. Also checks whether a newer ari-hooks is
+ * published, since this is the one moment we know a user is watching.
  */
 async function onSessionStart(input) {
   // Compaction restarts the session mid-conversation; the tasks were
@@ -269,54 +340,50 @@ async function onSessionStart(input) {
   const config = loadConfig();
   if (!config.token) return;
 
-  const response = await fetch(new URL('/agent-tasks', getApiUrl(config)), {
-    headers: { Authorization: `Bearer ${config.token}` },
-    signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
-  });
-  if (!response.ok) {
-    throw new Error(`GET /agent-tasks failed: ${response.status}`);
-  }
+  const [tasks, update] = await Promise.all([fetchTasks(config), checkForUpdate()]);
+  if (tasks.length === 0 && !update) return;
 
-  const body = await response.json();
-  // The API wraps the list ({ tasks: [...] }); accept a bare array too.
-  const list = Array.isArray(body) ? body : Array.isArray(body?.tasks) ? body.tasks : [];
-  const tasks = list
-    .filter(
-      (t) =>
-        t &&
-        typeof t.taskName === 'string' &&
-        t.taskName.trim() &&
-        typeof t.prompt === 'string' &&
-        t.prompt.trim()
-    )
-    .slice(0, MAX_TASKS);
-  if (tasks.length === 0) return;
+  const updateNotice = update
+    ? `ari-hooks ${update.current} is out of date (latest: ${update.latest}). ` +
+      `Update it: npm install -g ${NPM_PACKAGE}@latest`
+    : null;
 
-  const additionalContext =
-    `The user has Ari connected via ari-hooks. At session start the user was ` +
-    `shown this list of suggested tasks:\n\n` +
-    tasks
-      .map(
-        (t, i) =>
-          `Task ${i + 1}: ${oneLine(t.taskName)}\nPrompt: ${clamp(t.prompt)}`
-      )
-      .join('\n\n') +
-    `\n\nIf the user asks to run one of these tasks (by number or name), ` +
-    `carry out that task's prompt as if the user had typed it. Do not start ` +
-    `any of these tasks unless the user asks.`;
+  const taskContext =
+    tasks.length > 0
+      ? `The user has Ari connected via ari-hooks. At session start the user was ` +
+        `shown this list of suggested tasks:\n\n` +
+        tasks
+          .map(
+            (t, i) =>
+              `Task ${i + 1}: ${oneLine(t.taskName)}\nPrompt: ${clamp(t.prompt)}`
+          )
+          .join('\n\n') +
+        `\n\nIf the user asks to run one of these tasks (by number or name), ` +
+        `carry out that task's prompt as if the user had typed it. Do not start ` +
+        `any of these tasks unless the user asks.`
+      : null;
+
+  const additionalContext = [
+    updateNotice ? `Note for the user: ${updateNotice}` : null,
+    taskContext,
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 
   // Cursor's sessionStart output is a flat { additional_context } and it has
   // no user-visible systemMessage channel, so the agent itself must surface
-  // the list.
+  // the list (and the update notice).
   if (isCursorInput(input)) {
     writeSync(
       1,
       JSON.stringify({
         additional_context:
           additionalContext +
-          `\n\nNote: unlike Claude Code, Cursor did NOT show the user this ` +
-          `list — briefly offer these tasks by name at the start of your ` +
-          `first reply.`,
+          (tasks.length > 0
+            ? `\n\nNote: unlike Claude Code, Cursor did NOT show the user this ` +
+              `list — briefly offer these tasks by name at the start of your ` +
+              `first reply.`
+            : ''),
       }) + '\n'
     );
     return;
@@ -326,15 +393,23 @@ async function onSessionStart(input) {
   // pushes our block below the fixed "SessionStart:<source> says:" prefix.
   const BOLD = '\x1b[1m';
   const CYAN = '\x1b[36m';
+  const YELLOW = '\x1b[33m';
   const GREY = '\x1b[37m';
   const RESET = '\x1b[0m';
-  const visibleList = tasks
-    .map((t, i) => `  ${BOLD}${i + 1}.${RESET} ${oneLine(t.taskName)}`)
-    .join('\n');
-  const systemMessage =
-    `\n${BOLD}${CYAN}✻ Ari — things Claude can take care of for you right now${RESET}\n` +
-    `${visibleList}\n` +
-    `${GREY}Reply "run task 1" (or the task name) to start one.${RESET}`;
+
+  const messageBlocks = [];
+  if (updateNotice) messageBlocks.push(`${YELLOW}⚠ ${updateNotice}${RESET}`);
+  if (tasks.length > 0) {
+    const visibleList = tasks
+      .map((t, i) => `  ${BOLD}${i + 1}.${RESET} ${oneLine(t.taskName)}`)
+      .join('\n');
+    messageBlocks.push(
+      `${BOLD}${CYAN}✻ Ari — things Claude can take care of for you right now${RESET}\n` +
+        `${visibleList}\n` +
+        `${GREY}Reply "run task 1" (or the task name) to start one.${RESET}`
+    );
+  }
+  const systemMessage = `\n${messageBlocks.join('\n')}`;
 
   // writeSync: process.exit(0) in runHook would race an async stdout write.
   writeSync(
