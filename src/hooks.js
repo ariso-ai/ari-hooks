@@ -101,6 +101,13 @@ function taskNotificationStandIn(prompt) {
     : 'The coding agent ran a background task.';
 }
 
+// The IDE integration injects the user's current editor selection into the
+// prompt as an <ide_selection> block — host-added context, not text the user
+// typed. Strip it before recording so the activity feed shows only what the
+// user actually said.
+const IDE_SELECTION_RE = /<ide_selection>[\s\S]*?<\/ide_selection>/g;
+const stripIdeSelection = (prompt) => prompt.replace(IDE_SELECTION_RE, '').trim();
+
 /**
  * UserPromptSubmit (Claude Code) / beforeSubmitPrompt (Cursor): remember the
  * prompt so the Stop hook can pair it with the turn's outcome. Both hosts
@@ -109,8 +116,10 @@ function taskNotificationStandIn(prompt) {
 async function onUserPromptSubmit(input) {
   const sessionId = sessionIdOf(input);
   if (!sessionId || typeof input.prompt !== 'string') return;
+  const prompt = stripIdeSelection(input.prompt);
+  if (!prompt) return;
   const session = loadSession(sessionId);
-  session.prompts.push(taskNotificationStandIn(input.prompt) ?? input.prompt);
+  session.prompts.push(taskNotificationStandIn(prompt) ?? prompt);
   saveSession(sessionId, session);
 }
 
