@@ -340,7 +340,7 @@ async function onStop(input, agent) {
       // Cursor sends workspace_roots instead of cwd.
       cwd: input.cwd ?? input.workspace_roots?.[0] ?? process.cwd(),
       // Only sent when known — the API treats absent and unknown alike.
-      ...(model && { model }),
+      ...(model && { primary_model: model }),
       ...(tokens != null && { token_count: tokens }),
     }),
     signal: AbortSignal.timeout(SEND_TIMEOUT_MS),

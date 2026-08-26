@@ -391,7 +391,7 @@ test('user-prompt-submit + stop sends request/outcome to the API', async () => {
   assert.equal(received[0].body.session_id, sessionId);
   assert.equal(received[0].body.agent_type, 'claude-code');
   assert.equal(received[0].body.cwd, '/tmp/project');
-  assert.equal(received[0].body.model, 'claude-sonnet-5');
+  assert.equal(received[0].body.primary_model, 'claude-sonnet-5');
   // Sum of every metered token across the turn's two API calls.
   assert.equal(received[0].body.token_count, 100 + 900 + 50 + 200 + 1000 + 80);
 
@@ -661,7 +661,7 @@ test('stop reports the model and token count for just the current turn', async (
 
   assert.equal(received.length, 1);
   assert.equal(received[0].outcome, 'Fixed and tested.');
-  assert.equal(received[0].model, 'claude-sonnet-5');
+  assert.equal(received[0].primary_model, 'claude-sonnet-5');
   assert.equal(received[0].token_count, 15 + 10 + 95);
 });
 
@@ -684,7 +684,7 @@ test('stop still sends when the transcript is unreadable but the outcome is on t
 
   assert.equal(received.length, 1);
   assert.equal(received[0].outcome, 'Fixed it.');
-  assert.ok(!('model' in received[0]));
+  assert.ok(!('primary_model' in received[0]));
   assert.ok(!('token_count' in received[0]));
 });
 
@@ -720,7 +720,7 @@ test('cursor payloads: prompt + agent-response + stop send request/outcome', asy
   assert.equal(received[0].session_id, 'conv-42');
   assert.equal(received[0].agent_type, 'cursor');
   assert.equal(received[0].cwd, '/tmp/cursor-project');
-  assert.equal(received[0].model, 'gpt-5');
+  assert.equal(received[0].primary_model, 'gpt-5');
   // Cursor never reports token usage; the field is omitted, not zeroed.
   assert.ok(!('token_count' in received[0]));
   assert.ok(!existsSync(join(home, 'sessions', 'conv-42.json')));
@@ -755,7 +755,7 @@ test('codex payload: stop uses last_assistant_message as the outcome', async () 
   assert.equal(received[0].agent_type, 'codex');
   assert.equal(received[0].cwd, '/tmp/codex-project');
   // The Stop payload's model rides along; Codex reports no token usage.
-  assert.equal(received[0].model, 'gpt-5-codex');
+  assert.equal(received[0].primary_model, 'gpt-5-codex');
   assert.ok(!('token_count' in received[0]));
   assert.ok(!existsSync(join(home, 'sessions', 'codex-1.json')));
 });
