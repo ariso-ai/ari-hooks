@@ -10,6 +10,22 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 const BIN = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'ari-hooks.js');
+const PKG_VERSION = JSON.parse(
+  readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8')
+).version;
+
+// Stubs the npm registry lookup the SessionStart hook makes to check for a
+// newer ari-hooks release, so tests never depend on real network access.
+function startRegistryStub(version) {
+  return new Promise((resolve) => {
+    const server = createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ version }));
+    });
+    server.listen(0, '127.0.0.1', () => resolve(server));
+  });
+}
+const registryUrlOf = (server) => `http://127.0.0.1:${server.address().port}`;
 
 // install/init detect Codex by the presence of ~/.codex (overridable via
 // CODEX_HOME). The Claude/Cursor tests pin it at a path that does not exist so
@@ -745,12 +761,15 @@ test('session-start fetches /agent-tasks and emits a visible list plus context',
     JSON.stringify({ token: 'ari_testtoken', apiUrl })
   );
 
+  const registry = await startRegistryStub(PKG_VERSION);
   const { stdout } = await runHook(
     'session-start',
     { session_id: 'sess-1', source: 'startup', cwd: '/tmp/project' },
-    home
+    home,
+    { ARI_HOOKS_REGISTRY_URL: registryUrlOf(registry) }
   );
   server.close();
+  registry.close();
 
   assert.equal(requests.length, 1);
   assert.equal(requests[0].url, '/agent-tasks');
@@ -762,12 +781,83 @@ test('session-start fetches /agent-tasks and emits a visible list plus context',
   assert.match(output.systemMessage, /1\..*Triage new bug reports/);
   assert.match(output.systemMessage, /3\..*Fix flaky tests/);
   assert.doesNotMatch(output.systemMessage, /fourth task/);
+  // Up to date: no update notice.
+  assert.doesNotMatch(output.systemMessage, /out of date/);
   // Claude's hidden context carries the prompts to run on request.
   assert.equal(output.hookSpecificOutput.hookEventName, 'SessionStart');
   assert.match(
     output.hookSpecificOutput.additionalContext,
     /Look at the open bug reports and triage them\./
   );
+});
+
+test('session-start shows an update notice when npm has published a newer ari-hooks', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));
+
+  const tasksServer = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ tasks: [] }));
+  });
+  await new Promise((r) => tasksServer.listen(0, '127.0.0.1', r));
+  writeFileSync(
+    join(home, 'config.json'),
+    JSON.stringify({
+      token: 'ari_testtoken',
+      apiUrl: `http://127.0.0.1:${tasksServer.address().port}`,
+    })
+  );
+
+  const registry = await startRegistryStub('99.0.0');
+  const { stdout } = await runHook(
+    'session-start',
+    { session_id: 'sess-1', source: 'startup' },
+    home,
+    { ARI_HOOKS_REGISTRY_URL: registryUrlOf(registry) }
+  );
+  tasksServer.close();
+  registry.close();
+
+  // Shown even with an empty task list — it's the only thing worth surfacing.
+  const output = JSON.parse(stdout);
+  assert.match(output.systemMessage, /out of date/);
+  assert.match(output.systemMessage, /npm install -g @ariso-ai\/ari-hooks@latest/);
+  assert.match(
+    output.hookSpecificOutput.additionalContext,
+    /Note for the user:.*npm install -g @ariso-ai\/ari-hooks@latest/
+  );
+});
+
+test("session-start ignores a registry that's down or errors", async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ari-hooks-home-'));
+
+  const tasksServer = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ tasks: [{ taskName: 'Triage bugs', prompt: 'Triage the open bugs.' }] }));
+  });
+  await new Promise((r) => tasksServer.listen(0, '127.0.0.1', r));
+  writeFileSync(
+    join(home, 'config.json'),
+    JSON.stringify({
+      token: 'ari_testtoken',
+      apiUrl: `http://127.0.0.1:${tasksServer.address().port}`,
+    })
+  );
+
+  const errServer = createServer((req, res) => res.writeHead(500).end());
+  await new Promise((r) => errServer.listen(0, '127.0.0.1', r));
+  const { stdout } = await runHook(
+    'session-start',
+    { session_id: 'sess-1', source: 'startup' },
+    home,
+    { ARI_HOOKS_REGISTRY_URL: registryUrlOf(errServer) }
+  );
+  tasksServer.close();
+  errServer.close();
+
+  // Tasks still show; a broken registry lookup is swallowed, not surfaced.
+  const output = JSON.parse(stdout);
+  assert.match(output.systemMessage, /Triage bugs/);
+  assert.doesNotMatch(output.systemMessage, /out of date/);
 });
 
 test('session-start from Cursor emits flat additional_context and skips background agents', async () => {
@@ -794,7 +884,9 @@ test('session-start from Cursor emits flat additional_context and skips backgrou
     composer_mode: 'agent',
     is_background_agent: false,
   };
-  const { stdout } = await runHook('session-start', cursorInput, home);
+  const registry = await startRegistryStub(PKG_VERSION);
+  const registryEnv = { ARI_HOOKS_REGISTRY_URL: registryUrlOf(registry) };
+  const { stdout } = await runHook('session-start', cursorInput, home, registryEnv);
 
   const output = JSON.parse(stdout);
   // Cursor's sessionStart output shape: no systemMessage/hookSpecificOutput.
@@ -804,9 +896,15 @@ test('session-start from Cursor emits flat additional_context and skips backgrou
   assert.match(output.additional_context, /Look at the open bug reports\./);
 
   // Headless background agents get nothing — no user to pick a task.
-  const bg = await runHook('session-start', { ...cursorInput, is_background_agent: true }, home);
+  const bg = await runHook(
+    'session-start',
+    { ...cursorInput, is_background_agent: true },
+    home,
+    registryEnv
+  );
   assert.equal(bg.stdout, '');
   server.close();
+  registry.close();
 });
 
 test('session-start is a silent no-op on compact, without a token, or with no tasks', async () => {
@@ -831,10 +929,14 @@ test('session-start is a silent no-op on compact, without a token, or with no ta
   result = await runHook('session-start', { source: 'compact' }, home);
   assert.equal(result.stdout, '');
 
-  // Empty task list → nothing shown.
-  result = await runHook('session-start', { source: 'startup' }, home);
+  // Empty task list and no update available → nothing shown.
+  const registry = await startRegistryStub(PKG_VERSION);
+  result = await runHook('session-start', { source: 'startup' }, home, {
+    ARI_HOOKS_REGISTRY_URL: registryUrlOf(registry),
+  });
   assert.equal(result.stdout, '');
   server.close();
+  registry.close();
 });
 
 test('stop hook is a silent no-op without a stored prompt or token', async () => {
