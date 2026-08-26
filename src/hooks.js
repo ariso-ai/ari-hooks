@@ -124,6 +124,11 @@ async function onUserPromptSubmit(input) {
   saveSession(sessionId, session);
 }
 
+// A model name from a hook payload, or null — hosts that include one send a
+// plain non-empty string.
+const modelOf = (value) =>
+  typeof value === 'string' && value.trim() ? value : null;
+
 /**
  * afterAgentResponse (Cursor only): Cursor's transcript is not the Claude
  * Code JSONL that extractOutcome can parse, so capture the final assistant
@@ -135,6 +140,8 @@ async function onAgentResponse(input) {
   if (!sessionId || typeof input.text !== 'string' || !input.text.trim()) return;
   const session = loadSession(sessionId);
   session.outcome = input.text;
+  const model = modelOf(input.model);
+  if (model) session.model = model;
   saveSession(sessionId, session);
 }
 
@@ -149,17 +156,7 @@ function assistantText(entry) {
     .trim();
 }
 
-/**
- * Pull the final assistant text out of the transcript (JSONL). This is the
- * "outcome" — we deliberately skip the intermediate steps/tool calls.
- *
- * `settled` reports whether the exchange actually ends in assistant text.
- * When the transcript instead ends at a tool call/result or a half-written
- * line, the final message hasn't been flushed yet and `text` is only the
- * last narration before a tool ran — the caller should re-read rather than
- * ship that as the outcome.
- */
-function extractOutcome(transcriptPath) {
+function parseTranscript(transcriptPath) {
   const entries = [];
   let tailPartial = false;
   for (const line of readFileSync(transcriptPath, 'utf8').split('\n')) {
@@ -171,7 +168,20 @@ function extractOutcome(transcriptPath) {
       tailPartial = true; // a line still being written
     }
   }
+  return { entries, tailPartial };
+}
 
+/**
+ * Pull the final assistant text out of the transcript entries. This is the
+ * "outcome" — we deliberately skip the intermediate steps/tool calls.
+ *
+ * `settled` reports whether the exchange actually ends in assistant text.
+ * When the transcript instead ends at a tool call/result or a half-written
+ * line, the final message hasn't been flushed yet and `text` is only the
+ * last narration before a tool ran — the caller should re-read rather than
+ * ship that as the outcome.
+ */
+function extractOutcome(entries, tailPartial) {
   let settled = tailPartial ? false : null;
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
@@ -196,12 +206,72 @@ function extractOutcome(transcriptPath) {
   return { text: null, settled: false };
 }
 
+// A user entry that is an actual typed prompt — not a tool result, not host
+// bookkeeping (isMeta), not a subagent's inner conversation (isSidechain).
+function isUserPrompt(entry) {
+  if (entry.type !== 'user' || entry.isSidechain || entry.isMeta) return false;
+  const content = entry.message?.content;
+  if (typeof content === 'string') return content.trim().length > 0;
+  return (
+    Array.isArray(content) &&
+    content.some((block) => block.type === 'text') &&
+    !content.some((block) => block.type === 'tool_result')
+  );
+}
+
+/**
+ * Model and token usage for the turn being reported. The transcript holds
+ * the whole session, so walk back past `promptCount` user prompts (this
+ * send covers that many queued prompts) and only count assistant entries
+ * after that point. Usage is keyed by message id — a message split across
+ * several JSONL entries (one per content block) repeats the same usage on
+ * each, and the last entry wins — then totalled over everything the API
+ * metered: input, cache writes/reads, and output. The model is named by
+ * the turn's last top-level assistant message; sidechain (subagent)
+ * entries still count toward tokens.
+ */
+function extractTurnStats(entries, promptCount) {
+  let boundary = -1;
+  let remaining = Math.max(1, promptCount);
+  for (let i = entries.length - 1; i >= 0 && remaining > 0; i--) {
+    if (isUserPrompt(entries[i])) {
+      boundary = i;
+      remaining--;
+    }
+  }
+
+  let model = null;
+  const usageById = new Map();
+  for (let i = boundary + 1; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry.type !== 'assistant') continue;
+    const message = entry.message ?? {};
+    // '<synthetic>' marks host-injected error messages, not a real model.
+    if (!entry.isSidechain && modelOf(message.model) && message.model !== '<synthetic>') {
+      model = message.model;
+    }
+    if (message.usage) usageById.set(message.id ?? `entry-${i}`, message.usage);
+  }
+
+  let tokens = null;
+  for (const usage of usageById.values()) {
+    tokens =
+      (tokens ?? 0) +
+      (usage.input_tokens ?? 0) +
+      (usage.cache_creation_input_tokens ?? 0) +
+      (usage.cache_read_input_tokens ?? 0) +
+      (usage.output_tokens ?? 0);
+  }
+  return { model, tokens };
+}
+
 const clamp = (text) =>
   text.length > MAX_TEXT_LENGTH ? text.slice(0, MAX_TEXT_LENGTH) : text;
 
 /**
  * Stop: the turn is over — send the accumulated request(s) plus the final
- * assistant message to Ari, then clear the per-session state.
+ * assistant message (and, when the host exposes them, the model used and
+ * the turn's token count) to Ari, then clear the per-session state.
  */
 async function onStop(input, agent) {
   // stop_hook_active means a stop hook already forced Claude to continue;
@@ -218,13 +288,36 @@ async function onStop(input, agent) {
   // last_assistant_message; Claude Code sessions read it from the transcript,
   // waiting for the final assistant message to land there (on timeout, fall
   // back to the last text we did find — best effort).
-  let outcome = session.outcome ?? input.last_assistant_message ?? null;
-  if (!outcome && input.transcript_path) {
+  const payloadOutcome = session.outcome ?? input.last_assistant_message ?? null;
+  let outcome = payloadOutcome;
+  // Hosts that hand us the outcome directly may also name the model on their
+  // payloads; Claude Code's model and token usage live only in the
+  // transcript. Token counts are transcript-only — the other hosts don't
+  // report usage. Recent Claude Code also sends last_assistant_message, so
+  // the transcript is read for stats even when the outcome is already in
+  // hand — but a stats failure must never cost us the activity itself.
+  let model = modelOf(input.model) ?? session.model ?? null;
+  let tokens = null;
+  if (input.transcript_path) {
     const deadline = Date.now() + OUTCOME_SETTLE_TIMEOUT_MS;
     for (;;) {
-      const { text, settled } = extractOutcome(input.transcript_path);
-      outcome = text;
-      if (settled || Date.now() >= deadline) break;
+      let entries, tailPartial;
+      try {
+        ({ entries, tailPartial } = parseTranscript(input.transcript_path));
+      } catch (err) {
+        logError(err);
+        break;
+      }
+      const { text, settled } = extractOutcome(entries, tailPartial);
+      outcome = payloadOutcome ?? text;
+      // Even with the outcome in hand, wait for the final message to flush
+      // so its usage makes it into the token count.
+      if (settled || Date.now() >= deadline) {
+        const stats = extractTurnStats(entries, session.prompts.length);
+        model = stats.model ?? model;
+        tokens = stats.tokens;
+        break;
+      }
       await sleep(OUTCOME_POLL_INTERVAL_MS);
     }
   }
@@ -246,6 +339,9 @@ async function onStop(input, agent) {
       agent_type: agentTypeOf(input, agent),
       // Cursor sends workspace_roots instead of cwd.
       cwd: input.cwd ?? input.workspace_roots?.[0] ?? process.cwd(),
+      // Only sent when known — the API treats absent and unknown alike.
+      ...(model && { primary_model: model }),
+      ...(tokens != null && { token_count: tokens }),
     }),
     signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
   });

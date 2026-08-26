@@ -350,11 +350,21 @@ test('user-prompt-submit + stop sends request/outcome to the API', async () => {
       JSON.stringify({ type: 'user', message: { content: 'Fix the login bug' } }),
       JSON.stringify({
         type: 'assistant',
-        message: { content: [{ type: 'tool_use', name: 'Bash' }] },
+        message: {
+          id: 'msg_1',
+          model: 'claude-sonnet-5',
+          content: [{ type: 'tool_use', name: 'Bash' }],
+          usage: { input_tokens: 100, cache_read_input_tokens: 900, output_tokens: 50 },
+        },
       }),
       JSON.stringify({
         type: 'assistant',
-        message: { content: [{ type: 'text', text: 'Fixed the login bug by patching auth.ts.' }] },
+        message: {
+          id: 'msg_2',
+          model: 'claude-sonnet-5',
+          content: [{ type: 'text', text: 'Fixed the login bug by patching auth.ts.' }],
+          usage: { input_tokens: 200, cache_read_input_tokens: 1000, output_tokens: 80 },
+        },
       }),
       '',
     ].join('\n')
@@ -381,6 +391,9 @@ test('user-prompt-submit + stop sends request/outcome to the API', async () => {
   assert.equal(received[0].body.session_id, sessionId);
   assert.equal(received[0].body.agent_type, 'claude-code');
   assert.equal(received[0].body.cwd, '/tmp/project');
+  assert.equal(received[0].body.primary_model, 'claude-sonnet-5');
+  // Sum of every metered token across the turn's two API calls.
+  assert.equal(received[0].body.token_count, 100 + 900 + 50 + 200 + 1000 + 80);
 
   // Session state is cleared after a successful send.
   assert.ok(!existsSync(join(home, 'sessions', 'sess-123.json')));
@@ -546,6 +559,135 @@ test('stop falls back to the pre-tool narration when the flush never settles', a
   assert.equal(received[0].outcome, 'Now running verification as required.');
 });
 
+// The transcript spans the whole session, so token/model stats must cover
+// only the turn being sent: walk back past as many user prompts as this
+// send bundles, dedupe usage repeated across a message's per-block entries,
+// count subagent (sidechain) usage, and never take the model from a
+// sidechain or '<synthetic>' entry.
+test('stop reports the model and token count for just the current turn', async () => {
+  const { home, received, server } = await stopTestSetup();
+  const transcriptPath = join(home, 'transcript.jsonl');
+  const entry = (obj) => JSON.stringify(obj);
+  writeFileSync(
+    transcriptPath,
+    [
+      // A previous, already-reported turn: excluded from the stats.
+      entry({ type: 'user', message: { content: 'Old question' } }),
+      entry({
+        type: 'assistant',
+        message: {
+          id: 'msg_0',
+          model: 'claude-opus-4-8',
+          content: [{ type: 'text', text: 'Old answer.' }],
+          usage: { input_tokens: 5000, output_tokens: 500 },
+        },
+      }),
+      // Current turn, first of two queued prompts.
+      entry({ type: 'user', message: { content: 'Fix the login bug' } }),
+      // One message split across two entries (one per block) repeats the
+      // same usage on each — it must be counted once (10 + 5).
+      entry({
+        type: 'assistant',
+        message: {
+          id: 'msg_1',
+          model: 'claude-fable-5',
+          content: [{ type: 'text', text: 'On it.' }],
+          usage: { input_tokens: 10, output_tokens: 5 },
+        },
+      }),
+      entry({
+        type: 'assistant',
+        message: {
+          id: 'msg_1',
+          model: 'claude-fable-5',
+          content: [{ type: 'tool_use', name: 'Task' }],
+          usage: { input_tokens: 10, output_tokens: 5 },
+        },
+      }),
+      // Tool results, host bookkeeping, and a subagent's inner prompt are
+      // not user-typed prompts — none may move the turn boundary.
+      entry({ type: 'user', message: { content: [{ type: 'tool_result' }] } }),
+      entry({ type: 'user', isMeta: true, message: { content: 'local command output' } }),
+      entry({ type: 'user', isSidechain: true, message: { content: 'subagent task' } }),
+      // Subagent usage counts toward the turn (7 + 3); its model does not.
+      entry({
+        type: 'assistant',
+        isSidechain: true,
+        message: {
+          id: 'side_1',
+          model: 'claude-haiku-4-5',
+          content: [{ type: 'text', text: 'subagent done' }],
+          usage: { input_tokens: 7, output_tokens: 3 },
+        },
+      }),
+      // Second queued prompt of the same send.
+      entry({ type: 'user', message: { content: 'Also update the tests' } }),
+      entry({
+        type: 'assistant',
+        message: { id: 'msg_2', model: '<synthetic>', content: [{ type: 'text', text: 'Retrying…' }] },
+      }),
+      entry({
+        type: 'assistant',
+        message: {
+          id: 'msg_3',
+          model: 'claude-sonnet-5',
+          content: [{ type: 'text', text: 'Fixed and tested.' }],
+          usage: {
+            input_tokens: 20,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 30,
+            output_tokens: 40,
+          },
+        },
+      }),
+      '',
+    ].join('\n')
+  );
+
+  await runHook('user-prompt-submit', { session_id: 'sess-stats', prompt: 'Fix the login bug' }, home);
+  await runHook('user-prompt-submit', { session_id: 'sess-stats', prompt: 'Also update the tests' }, home);
+  // Recent Claude Code sends last_assistant_message on Stop; the stats must
+  // still come from the transcript even though the outcome is already known.
+  await runHook(
+    'stop',
+    {
+      session_id: 'sess-stats',
+      transcript_path: transcriptPath,
+      last_assistant_message: 'Fixed and tested.',
+    },
+    home
+  );
+  server.close();
+
+  assert.equal(received.length, 1);
+  assert.equal(received[0].outcome, 'Fixed and tested.');
+  assert.equal(received[0].primary_model, 'claude-sonnet-5');
+  assert.equal(received[0].token_count, 15 + 10 + 95);
+});
+
+// Stats are best-effort: an unreadable transcript must not cost us the
+// activity when the payload already carries the outcome.
+test('stop still sends when the transcript is unreadable but the outcome is on the payload', async () => {
+  const { home, received, server } = await stopTestSetup();
+
+  await runHook('user-prompt-submit', { session_id: 'sess-noread', prompt: 'Fix the login bug' }, home);
+  await runHook(
+    'stop',
+    {
+      session_id: 'sess-noread',
+      transcript_path: join(home, 'does-not-exist.jsonl'),
+      last_assistant_message: 'Fixed it.',
+    },
+    home
+  );
+  server.close();
+
+  assert.equal(received.length, 1);
+  assert.equal(received[0].outcome, 'Fixed it.');
+  assert.ok(!('primary_model' in received[0]));
+  assert.ok(!('token_count' in received[0]));
+});
+
 // Cursor hooks send conversation_id (not session_id) and no parseable
 // transcript; afterAgentResponse hands us the assistant text instead.
 test('cursor payloads: prompt + agent-response + stop send request/outcome', async () => {
@@ -560,9 +702,14 @@ test('cursor payloads: prompt + agent-response + stop send request/outcome', asy
   await runHook('user-prompt-submit', { ...base, prompt: 'Fix the login bug' }, home);
   assert.ok(existsSync(join(home, 'sessions', 'conv-42.json')));
 
-  // Fires per assistant message; the last text wins as the outcome.
+  // Fires per assistant message; the last text wins as the outcome. A model
+  // named on the payload is remembered and reported with the activity.
   await runHook('agent-response', { ...base, text: 'Looking into it.' }, home);
-  await runHook('agent-response', { ...base, text: 'Fixed the login bug in auth.ts.' }, home);
+  await runHook(
+    'agent-response',
+    { ...base, text: 'Fixed the login bug in auth.ts.', model: 'gpt-5' },
+    home
+  );
 
   await runHook('stop', { ...base, status: 'completed', loop_count: 0 }, home, {}, 'cursor');
   server.close();
@@ -573,6 +720,9 @@ test('cursor payloads: prompt + agent-response + stop send request/outcome', asy
   assert.equal(received[0].session_id, 'conv-42');
   assert.equal(received[0].agent_type, 'cursor');
   assert.equal(received[0].cwd, '/tmp/cursor-project');
+  assert.equal(received[0].primary_model, 'gpt-5');
+  // Cursor never reports token usage; the field is omitted, not zeroed.
+  assert.ok(!('token_count' in received[0]));
   assert.ok(!existsSync(join(home, 'sessions', 'conv-42.json')));
 });
 
@@ -590,6 +740,7 @@ test('codex payload: stop uses last_assistant_message as the outcome', async () 
       cwd: '/tmp/codex-project',
       stop_hook_active: false,
       last_assistant_message: 'Fixed the login bug by patching auth.ts.',
+      model: 'gpt-5-codex',
     },
     home,
     {},
@@ -603,6 +754,9 @@ test('codex payload: stop uses last_assistant_message as the outcome', async () 
   assert.equal(received[0].session_id, 'codex-1');
   assert.equal(received[0].agent_type, 'codex');
   assert.equal(received[0].cwd, '/tmp/codex-project');
+  // The Stop payload's model rides along; Codex reports no token usage.
+  assert.equal(received[0].primary_model, 'gpt-5-codex');
+  assert.ok(!('token_count' in received[0]));
   assert.ok(!existsSync(join(home, 'sessions', 'codex-1.json')));
 });
 
