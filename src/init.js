@@ -224,8 +224,13 @@ async function ask(question) {
  * shared with everyone on the repo (settings.json).
  */
 async function chooseClaudeScope() {
-  const repoOnly = await ask('Install hooks just for this repo? [Y/n] ');
-  if (repoOnly === 'n' || repoOnly === 'no') return 'user';
+  const where = await ask(
+    'Do you want to install the hooks just for sessions in this folder, or for any session on this device?\n' +
+      '  1) Just this folder\n' +
+      '  2) Any session on this device\n' +
+      'Choose [1/2] (default 1): '
+  );
+  if (where === '2' || where === 'device' || where === 'any') return 'user';
 
   const who = await ask(
     'Install just for yourself, or for everyone who works on this repo?\n' +
