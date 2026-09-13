@@ -428,13 +428,13 @@ async function checkForUpdate() {
 }
 
 /**
- * SessionStart: ask Ari for the top tasks Claude can take care of right now
+ * SessionStart: ask Ari for the top tasks the coding agent can take care of right now
  * and surface them at boot — a visible list for the user (systemMessage)
- * plus the full prompts for Claude (additionalContext) so it can run
+ * plus the full prompts for the agent (additionalContext) so it can run
  * whichever one the user picks. Also checks whether a newer ari-hooks is
  * published, since this is the one moment we know a user is watching.
  */
-async function onSessionStart(input) {
+async function onSessionStart(input, agent) {
   // Compaction restarts the session mid-conversation; the tasks were
   // already offered, so don't show (or inject) them again.
   if (input.source === 'compact') return;
@@ -505,11 +505,14 @@ async function onSessionStart(input) {
   const messageBlocks = [];
   if (updateNotice) messageBlocks.push(`${YELLOW}⚠ ${updateNotice}${RESET}`);
   if (tasks.length > 0) {
+    const agentName = { 'claude-code': 'Claude', codex: 'Codex', cursor: 'Cursor' }[
+      agentTypeOf(input, agent)
+    ];
     const visibleList = tasks
       .map((t, i) => `  ${BOLD}${i + 1}.${RESET} ${oneLine(t.taskName)}`)
       .join('\n');
     messageBlocks.push(
-      `${BOLD}${CYAN}✻ Ari — things Claude can take care of for you right now${RESET}\n` +
+      `${BOLD}${CYAN}✻ Ari — things ${agentName} can take care of for you right now${RESET}\n` +
         `${visibleList}\n` +
         `${GREY}Reply "run task 1" (or the task name) to start one.${RESET}`
     );
@@ -545,7 +548,7 @@ export async function runHook(event, agent) {
     } else if (event === 'stop') {
       await onStop(input, agent);
     } else if (event === 'session-start') {
-      await onSessionStart(input);
+      await onSessionStart(input, agent);
     }
   } catch (err) {
     logError(err);
