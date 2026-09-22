@@ -9,6 +9,9 @@ import { createServer } from 'node:http';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+// uninstall also visits user settings. Keep all subprocesses away from the
+// developer's real Claude hooks, while still detecting a Claude installation.
+process.env.CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'ari-hooks-claude-home-'));
 const BIN = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'ari-hooks.js');
 const PKG_VERSION = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8')
@@ -754,10 +757,192 @@ test('codex payload: stop uses last_assistant_message as the outcome', async () 
   assert.equal(received[0].session_id, 'codex-1');
   assert.equal(received[0].agent_type, 'codex');
   assert.equal(received[0].cwd, '/tmp/codex-project');
-  // The Stop payload's model rides along; Codex reports no token usage.
+  // Without a transcript, only the Stop payload's model is available.
   assert.equal(received[0].primary_model, 'gpt-5-codex');
   assert.ok(!('token_count' in received[0]));
   assert.ok(!existsSync(join(home, 'sessions', 'codex-1.json')));
+});
+
+test('Codex reports only the requested turn usage, without double counting', async (t) => {
+  const { home, received, server } = await stopTestSetup();
+  t.after(() => server.close());
+  const transcriptPath = join(home, 'codex.jsonl');
+  const event = (type, data = {}) => ({ type: 'event_msg', payload: { type, ...data } });
+  const usage = (total) => event('token_count', { info: { total_token_usage: {
+    total_tokens: total, input_tokens: total - 20, output_tokens: 20,
+    cached_input_tokens: 50, reasoning_output_tokens: 10,
+  } } });
+  const entries = [
+    event('task_started', { turn_id: 'previous' }),
+    usage(1000),
+    event('task_complete', { turn_id: 'previous' }),
+    event('task_started', { turn_id: 'current' }),
+    { type: 'turn_context', payload: { turn_id: 'current', model: 'gpt-6-astra' } },
+    event('user_message', { message: 'Fix it' }),
+    usage(1100), usage(1100),
+    // A repeated context during a turn must not reset the usage boundary.
+    { type: 'turn_context', payload: { turn_id: 'current', model: 'gpt-6-astra' } },
+    usage(1350),
+    event('token_count', { info: null }),
+    event('task_complete', { turn_id: 'current' }),
+    event('task_started', { turn_id: 'later' }),
+    usage(2000),
+  ];
+  writeFileSync(transcriptPath, entries.map(JSON.stringify).join('\n'));
+  for (const agent of [undefined, 'codex', 'claude']) {
+    const base = { session_id: `usage-${agent}`, turn_id: 'current', transcript_path: transcriptPath };
+    await runHook('user-prompt-submit', { ...base, prompt: 'Fix it' }, home, {}, agent);
+    await runHook('stop', { ...base, last_assistant_message: 'Fixed' }, home, {}, agent);
+  }
+  assert.equal(received.length, 3);
+  for (const activity of received) {
+    assert.equal(activity.token_count, 350);
+    assert.equal(activity.primary_model, 'gpt-6-astra');
+    assert.equal(activity.agent_type, 'codex');
+  }
+});
+
+test('Codex usage handles first turns, legacy boundaries, and unavailable usage', async (t) => {
+  const { home, received, server } = await stopTestSetup();
+  t.after(() => server.close());
+  for (const [name, turnId, entries, expected] of [
+    ['first', 'first', [
+      { type: 'turn_context', payload: { turn_id: 'first' } },
+      { type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: {
+        input_tokens: 100, output_tokens: 20, cached_input_tokens: 80, reasoning_output_tokens: 10,
+      } } } },
+    ], 120],
+    ['legacy', undefined, [
+      { type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 500 } } } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'Fix it' } },
+      { type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 600 } } } },
+    ], 100],
+    ['unknown-turn', 'missing', [
+      { type: 'turn_context', payload: { turn_id: 'other' } },
+      { type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 500 } } } },
+    ], undefined],
+    ['no-usage', 'empty', [{ type: 'turn_context', payload: { turn_id: 'empty' } }], undefined],
+  ]) {
+    const transcriptPath = join(home, `${name}.jsonl`);
+    writeFileSync(transcriptPath, entries.map(JSON.stringify).join('\n'));
+    const base = { session_id: name, turn_id: turnId, transcript_path: transcriptPath };
+    await runHook('user-prompt-submit', { ...base, prompt: 'Fix it' }, home, {}, 'codex');
+    await runHook('stop', { ...base, last_assistant_message: 'Fixed' }, home, {}, 'codex');
+    assert.equal(received.at(-1).token_count, expected, name);
+  }
+  assert.equal(received.length, 4);
+});
+
+test('Codex transcript payloads identify correctly with legacy or incorrect flags', async (t) => {
+  const { home, received, server } = await stopTestSetup();
+  t.after(() => server.close());
+  for (const agent of [undefined, 'codex', 'claude']) {
+    const base = {
+      session_id: `codex-transcript-${agent}`,
+      turn_id: 'turn-1',
+      transcript_path: join(home, 'codex-transcript.jsonl'),
+      model: 'gpt-6-astra',
+    };
+    await runHook('user-prompt-submit', { ...base, prompt: 'Just reply received' }, home, {}, agent);
+    await runHook('stop', { ...base, last_assistant_message: 'received' }, home, {}, agent);
+  }
+  assert.equal(received.length, 3);
+  assert.ok(received.every((activity) => activity.agent_type === 'codex'));
+  assert.ok(received.every((activity) => activity.primary_model === 'gpt-6-astra'));
+  // Codex transcripts must not be fed to the Claude transcript reader.
+  assert.ok(!existsSync(join(home, 'error.log')));
+});
+
+test('Codex waits for a partially written usage event', async (t) => {
+  const { home, received, server } = await stopTestSetup();
+  t.after(() => server.close());
+  const transcriptPath = join(home, 'codex-flushing.jsonl');
+  const context = JSON.stringify({ type: 'turn_context', payload: { turn_id: 'flushing' } });
+  const usage = JSON.stringify({ type: 'event_msg', payload: {
+    type: 'token_count', info: { total_token_usage: { total_tokens: 125 } },
+  } });
+  writeFileSync(transcriptPath, `${context}\n${usage.slice(0, 30)}`);
+  const base = { session_id: 'flushing', turn_id: 'flushing', transcript_path: transcriptPath };
+  await runHook('user-prompt-submit', { ...base, prompt: 'Fix it' }, home, {}, 'codex');
+  const sending = runHook('stop', { ...base, last_assistant_message: 'Fixed' }, home,
+    { ARI_HOOKS_SETTLE_TIMEOUT_MS: '2000' }, 'codex');
+  const timer = setTimeout(() => writeFileSync(transcriptPath, `${context}\n${usage}\n`), 200);
+  t.after(() => clearTimeout(timer));
+  await sending;
+  assert.equal(received.length, 1);
+  assert.equal(received[0].token_count, 125);
+});
+
+test('overlapping legacy and global Codex hooks submit each turn exactly once', async (t) => {
+  const { home, received, server } = await stopTestSetup();
+  t.after(() => server.close());
+  const base = {
+    session_id: 'overlapping-codex',
+    transcript_path: join(home, 'rollout.jsonl'),
+    model: 'gpt-6-astra',
+  };
+  for (const turn_id of ['turn-1', 'turn-2']) {
+    const prompt = { ...base, turn_id, prompt: 'Just reply received' };
+    const stop = { ...base, turn_id, last_assistant_message: 'received' };
+    await Promise.all([
+      runHook('user-prompt-submit', prompt, home),
+      runHook('user-prompt-submit', prompt, home, {}, 'codex'),
+    ]);
+    if (turn_id === 'turn-2') {
+      await runHook('stop', { ...stop, turn_id: 'turn-1' }, home);
+      assert.equal(received.length, 1, 'a stale Stop must not consume the next turn');
+    }
+    await Promise.all([
+      runHook('stop', stop, home),
+      runHook('stop', stop, home, {}, 'codex'),
+    ]);
+    // A late duplicate registration must not resurrect a finished turn.
+    await runHook('user-prompt-submit', prompt, home);
+    await runHook('stop', stop, home);
+  }
+  assert.equal(received.length, 2);
+  for (const activity of received) {
+    assert.equal(activity.agent_type, 'codex');
+    assert.equal(activity.request, 'Just reply received');
+    assert.equal(activity.outcome, 'received');
+  }
+  assert.ok(!existsSync(join(home, 'error.log')));
+});
+
+test('concurrent Stop hooks without turn ids consume the session once', async (t) => {
+  const { home, received, server } = await stopTestSetup();
+  t.after(() => server.close());
+  const base = { session_id: 'legacy-concurrent' };
+  await runHook('user-prompt-submit', { ...base, prompt: 'hello' }, home);
+  await Promise.all(Array.from({ length: 4 }, () =>
+    runHook('stop', { ...base, last_assistant_message: 'received' }, home)
+  ));
+  assert.equal(received.length, 1);
+  assert.ok(!existsSync(join(home, 'sessions', `${base.session_id}.json.lock`)));
+});
+
+test('a failed send releases the session lock and preserves the turn for retry', async (t) => {
+  const { home, received, server } = await stopTestSetup();
+  t.after(() => server.close());
+  const successHandler = server.listeners('request')[0];
+  server.removeAllListeners('request');
+  server.once('request', (req, res) => {
+    req.resume();
+    res.writeHead(500).end();
+  });
+  const base = { session_id: 'retry-codex', turn_id: 'turn-1' };
+  const stop = { ...base, last_assistant_message: 'received' };
+  await runHook('user-prompt-submit', { ...base, prompt: 'hello' }, home);
+  await runHook('stop', stop, home);
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(home, 'sessions', 'retry-codex.json'), 'utf8')).prompts,
+    ['hello']
+  );
+  assert.ok(!existsSync(join(home, 'sessions', 'retry-codex.json.lock')));
+  server.on('request', successHandler);
+  await runHook('stop', stop, home);
+  assert.equal(received.length, 1);
+  assert.equal(received[0].request, 'hello');
 });
 
 // Installs that predate the --agent flag send no flag; onStop falls back to

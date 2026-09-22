@@ -7,6 +7,7 @@ import {
   writeSync,
   rmSync,
   appendFileSync,
+  statSync,
 } from 'node:fs';
 import { configDir, loadConfig, getApiUrl } from './config.js';
 
@@ -71,13 +72,12 @@ const isCursorInput = (input) => typeof input.cursor_version === 'string';
 // bakes it into each agent's config file).
 const AGENT_TYPES = { claude: 'claude-code', codex: 'codex', cursor: 'cursor' };
 
-// Which coding agent produced this turn. The --agent flag from the hook command
-// is the reliable source; fall back to sniffing the payload for installs that
-// predate the flag — Cursor stamps cursor_version, Claude Code sends a
-// transcript_path, and Codex has neither (it hands us last_assistant_message).
+// Codex also sends transcript_path. Its turn_id distinguishes its turn hooks
+// from Claude's, including older installations without an --agent flag.
 function agentTypeOf(input, agent) {
-  if (AGENT_TYPES[agent]) return AGENT_TYPES[agent];
   if (isCursorInput(input)) return 'cursor';
+  if (typeof input.turn_id === 'string' && input.turn_id) return 'codex';
+  if (AGENT_TYPES[agent]) return AGENT_TYPES[agent];
   if (input.transcript_path) return 'claude-code';
   return 'codex';
 }
@@ -120,6 +120,8 @@ async function onUserPromptSubmit(input) {
   const prompt = stripIdeSelection(input.prompt);
   if (!prompt) return;
   const session = loadSession(sessionId);
+  if (input.turn_id && session.turnId === input.turn_id) return;
+  if (input.turn_id) session.turnId = input.turn_id;
   session.prompts.push(taskNotificationStandIn(prompt) ?? prompt);
   saveSession(sessionId, session);
 }
@@ -265,6 +267,50 @@ function extractTurnStats(entries, promptCount) {
   return { model, tokens };
 }
 
+// Codex records cumulative session usage, not usage on assistant messages.
+// Subtract the last total before this turn; repeated token_count events must
+// not be summed. Cached input and reasoning output are already in the total.
+function extractCodexTurnStats(entries, turnId) {
+  let boundary = -1;
+  for (let i = 0; i < entries.length; i++) {
+    const { type, payload } = entries[i];
+    const startsTurn = (type === 'event_msg' && payload?.type === 'task_started') ||
+      type === 'turn_context';
+    if (turnId) {
+      if (startsTurn && payload?.turn_id === turnId) {
+        boundary = i;
+        break;
+      }
+    } else if (type === 'event_msg' && payload?.type === 'user_message') {
+      boundary = i;
+    }
+  }
+  if (boundary < 0) return { model: null, tokens: null };
+
+  let baseline = 0;
+  let total = null;
+  let model = null;
+  for (let i = 0; i < entries.length; i++) {
+    const { type, payload } = entries[i];
+    if (i > boundary && turnId && payload?.turn_id && payload.turn_id !== turnId &&
+        (type === 'turn_context' || (type === 'event_msg' && payload.type === 'task_started'))) break;
+    if (i >= boundary && type === 'turn_context') model = modelOf(payload?.model) ?? model;
+    if (type === 'event_msg' && payload?.type === 'token_count') {
+      const usage = payload.info?.total_token_usage;
+      const count = usage?.total_tokens ?? (
+        Number.isFinite(usage?.input_tokens) && Number.isFinite(usage?.output_tokens)
+          ? usage.input_tokens + usage.output_tokens : null
+      );
+      if (Number.isFinite(count) && count >= 0) {
+        if (i < boundary) baseline = count;
+        else total = count;
+      }
+    }
+    if (i >= boundary && type === 'event_msg' && payload?.type === 'task_complete') break;
+  }
+  return { model, tokens: total != null && total >= baseline ? total - baseline : null };
+}
+
 const clamp = (text) =>
   text.length > MAX_TEXT_LENGTH ? text.slice(0, MAX_TEXT_LENGTH) : text;
 
@@ -282,6 +328,7 @@ async function onStop(input, agent) {
 
   const session = loadSession(sessionId);
   if (session.prompts.length === 0) return;
+  if (input.turn_id && session.turnId && input.turn_id !== session.turnId) return;
 
   // Cursor sessions get the outcome pushed to us via afterAgentResponse; Codex
   // hands us the final text directly on the Stop payload as
@@ -291,14 +338,32 @@ async function onStop(input, agent) {
   const payloadOutcome = session.outcome ?? input.last_assistant_message ?? null;
   let outcome = payloadOutcome;
   // Hosts that hand us the outcome directly may also name the model on their
-  // payloads; Claude Code's model and token usage live only in the
-  // transcript. Token counts are transcript-only — the other hosts don't
-  // report usage. Recent Claude Code also sends last_assistant_message, so
+  // payloads; Claude Code and Codex token usage lives in their transcripts.
+  // Recent Claude Code also sends last_assistant_message, so
   // the transcript is read for stats even when the outcome is already in
   // hand — but a stats failure must never cost us the activity itself.
   let model = modelOf(input.model) ?? session.model ?? null;
   let tokens = null;
-  if (input.transcript_path) {
+  const agentType = agentTypeOf(input, agent);
+  if (input.transcript_path && agentType === 'codex') {
+    const deadline = Date.now() + OUTCOME_SETTLE_TIMEOUT_MS;
+    for (;;) {
+      try {
+        const { entries, tailPartial } = parseTranscript(input.transcript_path);
+        if (tailPartial && Date.now() < deadline) {
+          await sleep(OUTCOME_POLL_INTERVAL_MS);
+          continue;
+        }
+        const stats = extractCodexTurnStats(entries, input.turn_id ?? session.turnId);
+        model = stats.model ?? model;
+        tokens = stats.tokens;
+      } catch (err) {
+        if (err.code !== 'ENOENT') logError(err);
+      }
+      break;
+    }
+  }
+  if (input.transcript_path && agentType === 'claude-code') {
     const deadline = Date.now() + OUTCOME_SETTLE_TIMEOUT_MS;
     for (;;) {
       let entries, tailPartial;
@@ -349,7 +414,47 @@ async function onStop(input, agent) {
     throw new Error(`POST /agent-activities failed: ${response.status}`);
   }
 
-  rmSync(sessionPath(sessionId), { force: true });
+  if (session.turnId) {
+    // Retain the turn receipt so a delayed duplicate prompt hook cannot
+    // resurrect an already submitted turn. A new turn id is still accepted.
+    saveSession(sessionId, { prompts: [], turnId: session.turnId });
+  } else {
+    rmSync(sessionPath(sessionId), { force: true });
+  }
+}
+
+// Project and user hooks can run concurrently. Serialize their read/modify/
+// send cycle across processes, including prompts, so only one Stop consumes
+// the queued request. Expire abandoned locks after more than a hook's normal
+// lifetime; failures leave the session available for retry.
+async function withSessionLock(sessionId, action) {
+  mkdirSync(sessionsDir(), { recursive: true });
+  const lockPath = `${sessionPath(sessionId)}.lock`;
+  const deadline = Date.now() + 25_000;
+  for (;;) {
+    try {
+      mkdirSync(lockPath);
+      break;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > 60_000) {
+          rmSync(lockPath, { recursive: true, force: true });
+          continue;
+        }
+      } catch (err) {
+        if (err.code === 'ENOENT') continue;
+        throw err;
+      }
+      if (Date.now() >= deadline) throw new Error('Timed out waiting for session hook lock');
+      await sleep(50);
+    }
+  }
+  try {
+    await action();
+  } finally {
+    rmSync(lockPath, { recursive: true, force: true });
+  }
 }
 
 const MAX_TASKS = 3;
@@ -538,14 +643,22 @@ export async function runHook(event, agent) {
   try {
     const raw = await readStdin();
     const input = raw ? JSON.parse(raw) : {};
-    if (event === 'user-prompt-submit') {
-      await onUserPromptSubmit(input);
-    } else if (event === 'agent-response') {
-      await onAgentResponse(input);
-    } else if (event === 'stop') {
-      await onStop(input, agent);
-    } else if (event === 'session-start') {
-      await onSessionStart(input);
+    const dispatch = async () => {
+      if (event === 'user-prompt-submit') {
+        await onUserPromptSubmit(input);
+      } else if (event === 'agent-response') {
+        await onAgentResponse(input);
+      } else if (event === 'stop') {
+        await onStop(input, agent);
+      } else if (event === 'session-start') {
+        await onSessionStart(input);
+      }
+    };
+    const sessionId = sessionIdOf(input);
+    if (sessionId && ['user-prompt-submit', 'agent-response', 'stop'].includes(event)) {
+      await withSessionLock(sessionId, dispatch);
+    } else {
+      await dispatch();
     }
   } catch (err) {
     logError(err);
