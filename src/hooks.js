@@ -267,6 +267,50 @@ function extractTurnStats(entries, promptCount) {
   return { model, tokens };
 }
 
+// Codex records cumulative session usage, not usage on assistant messages.
+// Subtract the last total before this turn; repeated token_count events must
+// not be summed. Cached input and reasoning output are already in the total.
+function extractCodexTurnStats(entries, turnId) {
+  let boundary = -1;
+  for (let i = 0; i < entries.length; i++) {
+    const { type, payload } = entries[i];
+    const startsTurn = (type === 'event_msg' && payload?.type === 'task_started') ||
+      type === 'turn_context';
+    if (turnId) {
+      if (startsTurn && payload?.turn_id === turnId) {
+        boundary = i;
+        break;
+      }
+    } else if (type === 'event_msg' && payload?.type === 'user_message') {
+      boundary = i;
+    }
+  }
+  if (boundary < 0) return { model: null, tokens: null };
+
+  let baseline = 0;
+  let total = null;
+  let model = null;
+  for (let i = 0; i < entries.length; i++) {
+    const { type, payload } = entries[i];
+    if (i > boundary && turnId && payload?.turn_id && payload.turn_id !== turnId &&
+        (type === 'turn_context' || (type === 'event_msg' && payload.type === 'task_started'))) break;
+    if (i >= boundary && type === 'turn_context') model = modelOf(payload?.model) ?? model;
+    if (type === 'event_msg' && payload?.type === 'token_count') {
+      const usage = payload.info?.total_token_usage;
+      const count = usage?.total_tokens ?? (
+        Number.isFinite(usage?.input_tokens) && Number.isFinite(usage?.output_tokens)
+          ? usage.input_tokens + usage.output_tokens : null
+      );
+      if (Number.isFinite(count) && count >= 0) {
+        if (i < boundary) baseline = count;
+        else total = count;
+      }
+    }
+    if (i >= boundary && type === 'event_msg' && payload?.type === 'task_complete') break;
+  }
+  return { model, tokens: total != null && total >= baseline ? total - baseline : null };
+}
+
 const clamp = (text) =>
   text.length > MAX_TEXT_LENGTH ? text.slice(0, MAX_TEXT_LENGTH) : text;
 
@@ -294,14 +338,32 @@ async function onStop(input, agent) {
   const payloadOutcome = session.outcome ?? input.last_assistant_message ?? null;
   let outcome = payloadOutcome;
   // Hosts that hand us the outcome directly may also name the model on their
-  // payloads; Claude Code's model and token usage live only in the
-  // transcript. Token counts are transcript-only — the other hosts don't
-  // report usage. Recent Claude Code also sends last_assistant_message, so
+  // payloads; Claude Code and Codex token usage lives in their transcripts.
+  // Recent Claude Code also sends last_assistant_message, so
   // the transcript is read for stats even when the outcome is already in
   // hand — but a stats failure must never cost us the activity itself.
   let model = modelOf(input.model) ?? session.model ?? null;
   let tokens = null;
-  if (input.transcript_path && agentTypeOf(input, agent) === 'claude-code') {
+  const agentType = agentTypeOf(input, agent);
+  if (input.transcript_path && agentType === 'codex') {
+    const deadline = Date.now() + OUTCOME_SETTLE_TIMEOUT_MS;
+    for (;;) {
+      try {
+        const { entries, tailPartial } = parseTranscript(input.transcript_path);
+        if (tailPartial && Date.now() < deadline) {
+          await sleep(OUTCOME_POLL_INTERVAL_MS);
+          continue;
+        }
+        const stats = extractCodexTurnStats(entries, input.turn_id ?? session.turnId);
+        model = stats.model ?? model;
+        tokens = stats.tokens;
+      } catch (err) {
+        if (err.code !== 'ENOENT') logError(err);
+      }
+      break;
+    }
+  }
+  if (input.transcript_path && agentType === 'claude-code') {
     const deadline = Date.now() + OUTCOME_SETTLE_TIMEOUT_MS;
     for (;;) {
       let entries, tailPartial;
