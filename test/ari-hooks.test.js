@@ -1115,8 +1115,9 @@ test('session-start fetches /agent-tasks and emits a visible list plus context',
   assert.equal(requests[0].auth, 'Bearer ari_testtoken');
 
   const output = JSON.parse(stdout);
-  // The user-visible list names the top 3 tasks, nothing more (ANSI styling
-  // sits between the number and the name).
+  // The user-visible list is plain text for terminal and app hook displays.
+  assert.doesNotMatch(output.systemMessage, /\x1b|Claude|^\n/);
+  assert.match(output.systemMessage, /Ari — things I can take care of/);
   assert.match(output.systemMessage, /1\..*Triage new bug reports/);
   assert.match(output.systemMessage, /3\..*Fix flaky tests/);
   assert.doesNotMatch(output.systemMessage, /fourth task/);
@@ -1159,6 +1160,7 @@ test('session-start shows an update notice when npm has published a newer ari-ho
   // Shown even with an empty task list — it's the only thing worth surfacing.
   const output = JSON.parse(stdout);
   assert.match(output.systemMessage, /out of date/);
+  assert.doesNotMatch(output.systemMessage, /\x1b|^\n/);
   assert.match(output.systemMessage, /npm install -g @ariso-ai\/ari-hooks@latest/);
   assert.match(
     output.hookSpecificOutput.additionalContext,
