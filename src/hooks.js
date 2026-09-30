@@ -533,9 +533,9 @@ async function checkForUpdate() {
 }
 
 /**
- * SessionStart: ask Ari for the top tasks Claude can take care of right now
+ * SessionStart: ask Ari for the top tasks the agent can take care of right now
  * and surface them at boot — a visible list for the user (systemMessage)
- * plus the full prompts for Claude (additionalContext) so it can run
+ * plus the full prompts for the agent (additionalContext) so it can run
  * whichever one the user picks. Also checks whether a newer ari-hooks is
  * published, since this is the one moment we know a user is watching.
  */
@@ -599,27 +599,21 @@ async function onSessionStart(input) {
     return;
   }
 
-  // Claude Code renders systemMessage with ANSI intact; the leading \n
-  // pushes our block below the fixed "SessionStart:<source> says:" prefix.
-  const BOLD = '\x1b[1m';
-  const CYAN = '\x1b[36m';
-  const YELLOW = '\x1b[33m';
-  const GREY = '\x1b[37m';
-  const RESET = '\x1b[0m';
-
+  // Hook messages are also displayed outside terminals (including Codex),
+  // so use plain text without ANSI escapes or a leading blank line.
   const messageBlocks = [];
-  if (updateNotice) messageBlocks.push(`${YELLOW}⚠ ${updateNotice}${RESET}`);
+  if (updateNotice) messageBlocks.push(`⚠ ${updateNotice}`);
   if (tasks.length > 0) {
     const visibleList = tasks
-      .map((t, i) => `  ${BOLD}${i + 1}.${RESET} ${oneLine(t.taskName)}`)
+      .map((t, i) => `  ${i + 1}. ${oneLine(t.taskName)}`)
       .join('\n');
     messageBlocks.push(
-      `${BOLD}${CYAN}✻ Ari — things Claude can take care of for you right now${RESET}\n` +
+      `✻ Ari — things I can take care of for you right now\n` +
         `${visibleList}\n` +
-        `${GREY}Reply "run task 1" (or the task name) to start one.${RESET}`
+        `Reply "run task 1" (or the task name) to start one.`
     );
   }
-  const systemMessage = `\n${messageBlocks.join('\n')}`;
+  const systemMessage = messageBlocks.join('\n\n');
 
   // writeSync: process.exit(0) in runHook would race an async stdout write.
   writeSync(
