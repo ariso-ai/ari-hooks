@@ -1117,7 +1117,7 @@ test('session-start fetches /agent-tasks and emits a visible list plus context',
   const output = JSON.parse(stdout);
   // The user-visible list is plain text for terminal and app hook displays.
   assert.doesNotMatch(output.systemMessage, /\x1b|Claude|^\n/);
-  assert.match(output.systemMessage, /Ari — things I can take care of/);
+  assert.match(output.systemMessage, /Ari — things Codex can take care of/);
   assert.match(output.systemMessage, /1\..*Triage new bug reports/);
   assert.match(output.systemMessage, /3\..*Fix flaky tests/);
   assert.doesNotMatch(output.systemMessage, /fourth task/);
@@ -1129,6 +1129,42 @@ test('session-start fetches /agent-tasks and emits a visible list plus context',
     output.hookSpecificOutput.additionalContext,
     /Look at the open bug reports and triage them\./
   );
+});
+
+test('session-start names the runtime agent while keeping hook output plain text', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'ari-hooks-runtime-'));
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ tasks: [{ taskName: 'Fix a bug', prompt: 'Fix the bug.' }] }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  const registry = await startRegistryStub(PKG_VERSION);
+  t.after(() => registry.close());
+  writeFileSync(join(home, 'config.json'), JSON.stringify({
+    token: 'ari_testtoken', apiUrl: registryUrlOf(server),
+  }));
+
+  for (const { agent, transcript_path, name } of [
+    { agent: 'claude', name: 'Claude' },
+    { agent: 'codex', transcript_path: '/tmp/claude-transcript.jsonl', name: 'Codex' },
+    { transcript_path: '/tmp/claude-transcript.jsonl', name: 'Claude' },
+    { name: 'Codex' },
+  ]) {
+    const { stdout, stderr } = await runHook(
+      'session-start',
+      { session_id: 'runtime-label', source: 'startup', transcript_path },
+      home,
+      { ARI_HOOKS_REGISTRY_URL: registryUrlOf(registry) },
+      agent
+    );
+    assert.equal(stderr, '');
+    const output = JSON.parse(stdout);
+    assert.ok(output.systemMessage.startsWith(`✻ Ari — things ${name} can take care of`));
+    assert.doesNotMatch(output.systemMessage, /\x1b|^\n/);
+    assert.match(output.hookSpecificOutput.additionalContext, /Fix the bug\./);
+  }
+  assert.ok(!existsSync(join(home, 'error.log')));
 });
 
 test('session-start shows an update notice when npm has published a newer ari-hooks', async () => {
